@@ -15,7 +15,9 @@
 #include "render/bourbon/bourbon_context.h"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <memory_resource>
 #include <utility>
@@ -154,6 +156,34 @@ Eigen::Affine3f GeomAffine(const mjtNum* pos, const mjtNum* xmat) {
   return a;
 }
 
+// Resolves the effective RGBA of geom `i`, mirroring MuJoCo's setMaterial()
+// (engine_vis_visualize.c:225): the material colour is used when the geom has a
+// material, but the per-geom rgba overrides it whenever it differs from the
+// default (0.5,0.5,0.5,1) or the geom has no material.
+void EffectiveGeomRgba(const mjModel* m, int i, float out[4]) {
+  const int matid = m->geom_matid[i];
+  const float* geom_rgba = m->geom_rgba + 4 * i;
+  if (matid >= 0) {
+    const float* mr = m->mat_rgba + 4 * matid;
+    out[0] = mr[0]; out[1] = mr[1]; out[2] = mr[2]; out[3] = mr[3];
+  }
+  if (geom_rgba[0] != 0.5f || geom_rgba[1] != 0.5f || geom_rgba[2] != 0.5f ||
+      geom_rgba[3] != 1.0f || matid < 0) {
+    out[0] = geom_rgba[0]; out[1] = geom_rgba[1];
+    out[2] = geom_rgba[2]; out[3] = geom_rgba[3];
+  }
+}
+
+// Packs an RGBA colour into a 32-bit key (8 bits/channel) so materials that
+// share a flat colour are deduplicated exactly.
+uint32_t QuantizeRgba(const float rgba[4]) {
+  auto q = [](float v) -> uint32_t {
+    const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    return static_cast<uint32_t>(c * 255.0f + 0.5f);
+  };
+  return (q(rgba[0]) << 24) | (q(rgba[1]) << 16) | (q(rgba[2]) << 8) | q(rgba[3]);
+}
+
 }  // namespace
 
 struct BourbonContext::Impl {
@@ -204,12 +234,14 @@ struct BourbonContext::Impl {
   Eigen::Array4f clear_color = {0.12f, 0.14f, 0.18f, 1.0f};
 
   // Retained scene: one entry per model geom (size ngeom; entries for
-  // unsupported geom types have a null node). Plus a shared flat material and a
-  // single hard-coded distant light (Stage 1).
+  // unsupported geom types have a null node). Plus a per-colour flat-material
+  // cache and a single hard-coded distant light (Stage 1).
   std::vector<Renderable> geoms;
-  bourbon::RefPtr<bourbon::Material> default_material;
-  bourbon::SGNode* light_node = nullptr;
-  bourbon::RefPtr<bourbon::DistantLight> light;
+  const bourbon::BXDFClass* pbr_bxdf = nullptr;
+  const bourbon::PatternClass* pbr_pattern = nullptr;
+  std::map<uint32_t, bourbon::RefPtr<bourbon::Material>> material_cache;
+  std::vector<bourbon::SGNode*> light_nodes;
+  std::vector<bourbon::RefPtr<bourbon::DistantLight>> lights;
 
   std::chrono::steady_clock::time_point last_frame;
   bool have_last_frame = false;
@@ -303,9 +335,31 @@ struct BourbonContext::Impl {
       world->model().destroyAllRootNodes();
     }
     geoms.clear();
-    light_node = nullptr;
-    light.reset();
-    default_material.reset();
+    material_cache.clear();
+    pbr_bxdf = nullptr;
+    pbr_pattern = nullptr;
+    light_nodes.clear();
+    lights.clear();
+  }
+
+  // Returns a flat glTF-PBR material for `rgba`, creating and caching one per
+  // distinct (quantized) colour so geoms that share a colour share a material.
+  bourbon::RefPtr<bourbon::Material> GetOrCreateMaterial(const float rgba[4]) {
+    const uint32_t key = QuantizeRgba(rgba);
+    auto it = material_cache.find(key);
+    if (it != material_cache.end()) return it->second;
+
+    Eigen::Array4f base_color = {rgba[0], rgba[1], rgba[2], rgba[3]};
+    bourbon::Pattern::Params params = {
+        {bourbon::Token::Get("baseColor"), &base_color}};
+    auto material = bourbon::Material::Create(
+        pbr_bxdf,
+        bourbon::Pattern::Create(*pbr_pattern, params, {},
+                                 bourbon::SemiTransparencyKind::Opaque,
+                                 *model_heap, *model_graph, *sg_context),
+        *model_heap, *model_graph, *sg_context);
+    material_cache[key] = material;
+    return material;
   }
 
   // Builds the retained scene for `m`: a shared flat material, one node/shape
@@ -318,60 +372,71 @@ struct BourbonContext::Impl {
     bourbon::SGContext& sg = *sg_context;
     bourbon::Model& scene = world->model();
 
-    // Shared flat glTF-PBR material (Stage 3 replaces this with per-material
+    // Flat glTF-PBR material templates; GetOrCreateMaterial() instantiates one
+    // per distinct geom colour (Stage 3 replaces these with per-material
     // scalars/textures).
-    const auto* bxdf =
-        renderer_context->findBXDF(bourbon::Token::Get("glTFPbrBXDF"));
-    const auto* pattern =
+    pbr_bxdf = renderer_context->findBXDF(bourbon::Token::Get("glTFPbrBXDF"));
+    pbr_pattern =
         renderer_context->findPattern(bourbon::Token::Get("glTFPbrPattern"));
-    Eigen::Array4f base_color = {0.75f, 0.75f, 0.75f, 1.0f};
-    bourbon::Pattern::Params params = {
-        {bourbon::Token::Get("baseColor"), &base_color}};
-    default_material = bourbon::Material::Create(
-        bxdf,
-        bourbon::Pattern::Create(*pattern, params, {},
-                                 bourbon::SemiTransparencyKind::Opaque, h, g,
-                                 sg),
-        h, g, sg);
 
     geoms.assign(m->ngeom, Renderable{});
     for (int i = 0; i < m->ngeom; ++i) {
       bourbon::RefPtr<bourbon::Shape> shape = MakeShapeForGeom(m, i);
       if (!shape) continue;
+      float rgba[4];
+      EffectiveGeomRgba(m, i, rgba);
+      bourbon::RefPtr<bourbon::Material> material = GetOrCreateMaterial(rgba);
       bourbon::SGNode* node = scene.createNode();
       scene.addRootNode(*node);
       auto xform = bourbon::MatrixTransformer::Create(g);
       node->setTransformer(xform);
-      node->addShape(shape, default_material, h, g, sg);
+      node->addShape(shape, material, h, g, sg);
       geoms[i].node = node;
       geoms[i].xform = xform;
       geoms[i].shape = shape;
-      geoms[i].material = default_material;
+      geoms[i].material = material;
     }
 
     BuildLight();
   }
 
-  // A single hard-coded distant light so the scene is not rendered black
-  // (Stage 2 replaces this with the model's lights).
-  void BuildLight() {
+  // Adds one distant light travelling in world direction `dir` at `lux`
+  // illuminance. Direction only (from is the origin; DistantLight is placement-
+  // independent), so an identity node transform suffices.
+  void AddDistantLight(const Eigen::Vector3f& dir, float lux) {
     bourbon::TaskHeap& h = *model_heap;
     bourbon::TaskGraph& g = *model_graph;
     bourbon::SGContext& sg = *sg_context;
     bourbon::Model& scene = world->model();
 
     bourbon::DistantLight::Params p;
-    p.intensity = {3.0f, bourbon::LightSource::Intensity::Unit::Lux};
+    p.intensity = {lux, bourbon::LightSource::Intensity::Unit::Lux};
     // Colour defaults to unit-luminance white RGB.
     p.from = bourbon::Point<bourbon::Space::Object>{0.0f, 0.0f, 0.0f, 1.0f};
-    // Light travels down and slightly to the side (MuJoCo is z-up).
-    p.to = bourbon::Point<bourbon::Space::Object>{0.3f, 0.3f, -1.0f, 1.0f};
-    light = bourbon::DistantLight::Create(p, h, g, sg);
+    p.to = bourbon::Point<bourbon::Space::Object>{dir.x(), dir.y(), dir.z(),
+                                                  1.0f};
+    auto light = bourbon::DistantLight::Create(p, h, g, sg);
 
-    light_node = scene.createNode();
-    light_node->setTransformer(bourbon::MatrixTransformer::Create(g));
-    light_node->addLightSource(light, h, g, sg);
-    scene.addRootNode(*light_node);
+    bourbon::SGNode* node = scene.createNode();
+    node->setTransformer(bourbon::MatrixTransformer::Create(g));
+    node->addLightSource(light, h, g, sg);
+    scene.addRootNode(*node);
+
+    lights.push_back(std::move(light));
+    light_nodes.push_back(node);
+  }
+
+  // Hard-coded key + fill distant lights so the scene is neither black nor
+  // starkly single-sided (Stage 2 replaces these with the model's own lights
+  // and image-based lighting). MuJoCo is z-up; the key rakes down across a
+  // standing model and the dimmer fill lifts the opposite side.
+  void BuildLight() {
+    // Key: clear-noon-sun illuminance, paired with the camera's sunny-16
+    // photometric exposure (see the Camera setup) so the scene lands in range.
+    AddDistantLight(Eigen::Vector3f(0.3f, 0.5f, -1.0f), 100000.0f);
+    // Fill from the opposite side and less steep, at ~1/5 the key, to soften
+    // the shadow side without flattening the form.
+    AddDistantLight(Eigen::Vector3f(-0.5f, -0.4f, -0.6f), 20000.0f);
   }
 };
 
@@ -426,10 +491,21 @@ BourbonContext::BourbonContext(void* metal_layer)
   s.projection = bourbon::MatrixProjection::Create(
       bourbon::MatrixProjection::FrustumParams{}, *s.model_heap, *s.model_graph,
       *s.sg_context);
+  // Photometric exposure with the "sunny-16" preset (f/16, 1/125 s, ISO 100),
+  // matching bourbon's own viewer defaults. This is calibrated to correctly
+  // expose a scene lit by a ~100k-lux (clear-noon-sun) distant light — see
+  // BuildLight(). The two must be tuned together: a physically bright light
+  // with these camera settings lands in range, whereas an arbitrary linear
+  // exposure would not.
   s.camera = bourbon::Camera::Create(
       bourbon::Camera::Params{
           .extent = extent,
           .projection = s.projection,
+          .exposure_mode = bourbon::Camera::ExposureMode::Photometric,
+          .f_number = 16.0f,
+          .shutter_time = 1.0f / 125.0f,
+          .iso = 100.0f,
+          .ev_compensation = 0.0f,
       },
       *s.model_heap, *s.model_graph, *s.sg_context);
   s.world->model().setViewCamera(s.camera.get());
