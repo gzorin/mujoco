@@ -55,6 +55,8 @@
 #include <BourbonSG/Camera.h>
 #include <BourbonSG/LightSource.h>
 #include <BourbonSG/LightSources/DistantLight.h>
+#include <BourbonSG/LightSources/PointLight.h>
+#include <BourbonSG/LightSources/SpotLight.h>
 #include <BourbonSG/Material.h>
 #include <BourbonSG/MatrixTransformer.h>
 #include <BourbonSG/Model.h>
@@ -62,6 +64,7 @@
 #include <BourbonSG/Projections/MatrixProjection.h>
 #include <BourbonSG/SGContext.h>
 #include <BourbonSG/SGNode.h>
+#include <BourbonSG/SGObjectKind.h>
 #include <BourbonSG/ShapeInstance.h>
 #include <BourbonSG/ShapeVar.h>
 #include <BourbonSG/ShapeVarKind.h>
@@ -142,6 +145,39 @@ struct Renderable {
   bourbon::RefPtr<bourbon::Material> material;
 };
 
+// A retained light: an owned SGNode whose transform places/orients the light
+// each frame (bourbon lights read position/direction from the node transform,
+// not from world-space params). `kind` selects the concrete downcast for the
+// per-frame colour/intensity update. `intensity_value`/`intensity_unit` are the
+// magnitude in the unit bourbon requires for this kind, computed once at build.
+struct Light {
+  bourbon::SGNode* node = nullptr;  // owned by world->model()
+  bourbon::RefPtr<bourbon::MatrixTransformer> xform;
+  bourbon::RefPtr<bourbon::LightSource> source;
+  bourbon::SGObjectKind kind = bourbon::SGObjectKind::LightSourceMax;
+  float intensity_value = 0.0f;
+  bourbon::LightSource::Intensity::Unit intensity_unit =
+      bourbon::LightSource::Intensity::Unit::Lux;
+  bool is_headlight = false;
+};
+
+// Classic-scene fallback illumination (used when a model authors no physical
+// light_intensity, i.e. brightness lives in the [0,1] light_diffuse colour, as
+// in humanoid.xml/car.xml). These are calibrated against the camera's
+// "sunny-16" photometric exposure (see the Camera setup) so a classic scene
+// lands in range; they are the Stage-2 successors of the old hard-coded
+// key/fill lights. Directional lights get a fixed illuminance; punctual lights
+// get a candela derived from their build-time distance to the scene centre so
+// the illuminance they deliver near the model matches the directional target.
+constexpr float kClassicDirectionalLux = 100000.0f;
+// Punctual (spot/point) classic-scene intensity, in candela. With MuJoCo's
+// default attenuation {1,0,0} bourbon applies NO distance falloff (the shader
+// factor is clamp(1/att0, 0, 1) = 1), so this candela value is used directly as
+// the on-axis illuminance -- it is NOT divided by distance^2. Kept a bit under
+// the directional target so two overlapping spots plus the headlight stay in
+// range under the sunny-16 exposure.
+constexpr float kClassicPunctualCandela = 25000.0f;
+
 // Builds a rigid object->world transform from a MuJoCo position (3) and a
 // row-major 3x3 orientation (mjData::geom_xmat is row-major). Eigen's comma
 // initializer fills row-major, so this loads geom_xmat without transposing.
@@ -158,6 +194,38 @@ Eigen::Affine3f GeomAffine(const mjtNum* pos, const mjtNum* xmat) {
                                     static_cast<float>(pos[1]),
                                     static_cast<float>(pos[2]));
   return a;
+}
+
+// Any unit vector orthogonal to `v` (a port of mjr_orthoVec): cross with an
+// axis that is not parallel to `v`. Used to complete a light's orientation
+// frame, whose roll about its own axis is irrelevant for shading.
+Eigen::Vector3f OrthoVec(const Eigen::Vector3f& v) {
+  Eigen::Vector3f r = v.cross(Eigen::Vector3f(-1.0f, 0.0f, 0.0f));
+  if (r.squaredNorm() > 0.01f) return r.normalized();
+  return v.cross(Eigen::Vector3f(0.0f, 1.0f, 0.0f)).normalized();
+}
+
+// Builds a light node's object->world transform placing it at `pos` with its
+// local axis aligned to propagation direction `dir`. Bourbon lights store their
+// direction/position in object space and the shader applies the owning node's
+// object->world transform, so with default from/to (from=origin, to=+z, giving
+// object direction from-to = -z) this frame maps the light's propagation
+// direction to `dir` and its position to `pos`: LookInDirection sets row2 = -f,
+// so object -z -> +dir and object origin -> pos (see LookInDirection). This is
+// the same construction the prior renderer used and it also gives the correct
+// DistantLight sign (toward-light = to-from = -dir).
+Eigen::Affine3f LightFrame(const Eigen::Vector3f& pos, Eigen::Vector3f dir) {
+  if (dir.squaredNorm() < 1e-12f) dir = Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+  dir.normalize();
+  Eigen::Affine3f a;
+  a.matrix() = bourbon::LookInDirection(pos, dir, OrthoVec(dir)).inverse();
+  return a;
+}
+
+// Reads a MuJoCo float3 (light_xpos/light_xdir row) into an Eigen vector.
+Eigen::Vector3f ReadVec3(const mjtNum* p) {
+  return Eigen::Vector3f(static_cast<float>(p[0]), static_cast<float>(p[1]),
+                         static_cast<float>(p[2]));
 }
 
 // Resolves the effective RGBA of geom `i`, mirroring MuJoCo's setMaterial()
@@ -508,8 +576,9 @@ struct BourbonContext::Impl {
   // TriangleMesh shape caches, so geoms sharing a mesh/hfield share one Shape.
   std::map<int, bourbon::RefPtr<bourbon::Shape>> mesh_shape_cache;
   std::map<int, bourbon::RefPtr<bourbon::Shape>> hfield_shape_cache;
-  std::vector<bourbon::SGNode*> light_nodes;
-  std::vector<bourbon::RefPtr<bourbon::DistantLight>> lights;
+  // Retained lights: one per mjModel light (image lights leave a null-source
+  // slot for now; IBL lands in a later increment) followed by the headlight.
+  std::vector<Light> lights;
 
   std::chrono::steady_clock::time_point last_frame;
   bool have_last_frame = false;
@@ -655,7 +724,6 @@ struct BourbonContext::Impl {
     hfield_shape_cache.clear();
     pbr_bxdf = nullptr;
     pbr_pattern = nullptr;
-    light_nodes.clear();
     lights.clear();
   }
 
@@ -714,7 +782,7 @@ struct BourbonContext::Impl {
       geoms[i].material = material;
     }
 
-    BuildLight();
+    BuildLights(m);
   }
 
   // Whether any geom produced a renderable node. Bourbon's forward pass graph
@@ -727,51 +795,182 @@ struct BourbonContext::Impl {
     return false;
   }
 
-  // Adds one distant light whose illumination arrives from world direction
-  // `toward_light` (the vector from a surface toward the light) at `lux`
-  // illuminance. Bourbon's DistantLight stores `direction = normalize(from - to)`
-  // and lights surfaces from the `to` side, so the toward-light vector is
-  // `to - from`; with `from` at the origin, `to = toward_light`. (The from/to
-  // naming is counterintuitive -- it is NOT the propagation direction.)
-  // DistantLight is placement-independent, so an identity node transform
-  // suffices.
-  void AddDistantLight(const Eigen::Vector3f& toward_light, float lux) {
+  // Pushes a light's live colour and intensity into its DGInputs, downcasting
+  // by kind (the concrete light types share no polymorphic setter). Colour is
+  // authored as plain RGB (no unit-luminance renormalisation) so a MuJoCo
+  // diffuse of e.g. 0.8 scales the light to 80% -- bourbon multiplies colour by
+  // intensity, so brightness carried in the [0,1] diffuse is preserved.
+  void SetLightColorIntensity(const Light& L, const Eigen::Array3f& rgb,
+                              float value,
+                              bourbon::LightSource::Intensity::Unit unit) const {
+    if (!L.source) return;
+    bourbon::LightSource::Colour color;
+    color.kind = bourbon::LightSource::Colour::Kind::RGB;
+    color.rgb = rgb;
+    color.normalise = false;
+    const bourbon::LightSource::Intensity intensity{value, unit};
+    switch (L.kind) {
+      case bourbon::SGObjectKind::DistantLight: {
+        auto* d = static_cast<bourbon::DistantLight*>(L.source.get());
+        d->color().setValueIfChanged(color);
+        d->intensity().setValueIfChanged(intensity);
+      } break;
+      case bourbon::SGObjectKind::SpotLight: {
+        auto* s = static_cast<bourbon::SpotLight*>(L.source.get());
+        s->color().setValueIfChanged(color);
+        s->intensity().setValueIfChanged(intensity);
+      } break;
+      case bourbon::SGObjectKind::PointLight: {
+        auto* p = static_cast<bourbon::PointLight*>(L.source.get());
+        p->color().setValueIfChanged(color);
+        p->intensity().setValueIfChanged(intensity);
+      } break;
+      default:
+        break;
+    }
+  }
+
+  // Creates and attaches one light node, wiring the shared per-frame plumbing
+  // (identity transform placeholder, addLightSource, addRootNode). `source` is
+  // the already-created concrete light; `kind` selects its per-frame downcast.
+  void AttachLight(Light& L) {
+    bourbon::Model& scene = world->model();
+    L.node = scene.createNode();
+    L.xform = bourbon::MatrixTransformer::Create(*model_graph);
+    L.node->setTransformer(L.xform);
+    L.node->addLightSource(L.source, *model_heap, *model_graph, *sg_context);
+    scene.addRootNode(*L.node);
+  }
+
+  // Builds the retained lights: one bourbon light per mjModel light (mapped by
+  // light_type) plus a directional headlight. Placement/orientation is driven
+  // entirely by each node's transform per frame (UpdateLights); only the
+  // per-kind magnitude/unit is fixed here. Replaces the old hard-coded key/fill
+  // pair. Image lights (mjLIGHT_IMAGE) get a null-source slot for now -- IBL
+  // lands in a later increment -- so the lights vector stays index-aligned with
+  // model lights (headlight last).
+  void BuildLights(const mjModel* m) {
     bourbon::TaskHeap& h = *model_heap;
     bourbon::TaskGraph& g = *model_graph;
     bourbon::SGContext& sg = *sg_context;
-    bourbon::Model& scene = world->model();
 
-    bourbon::DistantLight::Params p;
-    p.intensity = {lux, bourbon::LightSource::Intensity::Unit::Lux};
-    // Colour defaults to unit-luminance white RGB.
-    p.from = bourbon::Point<bourbon::Space::Object>{0.0f, 0.0f, 0.0f, 1.0f};
-    p.to = bourbon::Point<bourbon::Space::Object>{toward_light.x(),
-                                                  toward_light.y(),
-                                                  toward_light.z(), 1.0f};
-    auto light = bourbon::DistantLight::Create(p, h, g, sg);
+    // A classic scene authors no physical intensity (brightness lives in the
+    // [0,1] diffuse colour); detect that to substitute the photometric fallback.
+    float total_intensity = 0.0f;
+    for (int i = 0; i < m->nlight; ++i) total_intensity += m->light_intensity[i];
+    const bool classic = total_intensity <= 0.0f;
 
-    bourbon::SGNode* node = scene.createNode();
-    node->setTransformer(bourbon::MatrixTransformer::Create(g));
-    node->addLightSource(light, h, g, sg);
-    scene.addRootNode(*node);
+    using Unit = bourbon::LightSource::Intensity::Unit;
+    lights.clear();
+    lights.reserve(m->nlight + 1);
+    for (int i = 0; i < m->nlight; ++i) {
+      Light L;
+      bourbon::LightSource::Colour color;
+      color.rgb = Eigen::Array3f(m->light_diffuse[3 * i + 0],
+                                 m->light_diffuse[3 * i + 1],
+                                 m->light_diffuse[3 * i + 2]);
 
-    lights.push_back(std::move(light));
-    light_nodes.push_back(node);
+      // MuJoCo's OpenGL quadratic attenuation model (constant, linear,
+      // quadratic), forwarded verbatim; bourbon's shader uses the same
+      // 1/(a0 + a1 d + a2 d^2) form. Default {1,0,0} => no distance falloff.
+      const Eigen::Array3f attenuation(m->light_attenuation[3 * i + 0],
+                                       m->light_attenuation[3 * i + 1],
+                                       m->light_attenuation[3 * i + 2]);
+      const float classic_candela = kClassicPunctualCandela;
+
+      switch (m->light_type[i]) {
+        case mjLIGHT_DIRECTIONAL:
+          L.kind = bourbon::SGObjectKind::DistantLight;
+          L.intensity_unit = Unit::Lux;
+          L.intensity_value =
+              classic ? kClassicDirectionalLux : m->light_intensity[i];
+          L.source = bourbon::DistantLight::Create(
+              {.intensity = {L.intensity_value, L.intensity_unit},
+               .color = color},
+              h, g, sg);
+          break;
+        case mjLIGHT_SPOT: {
+          L.kind = bourbon::SGObjectKind::SpotLight;
+          L.intensity_unit = Unit::Candela;
+          L.intensity_value = classic ? classic_candela : m->light_intensity[i];
+          // MuJoCo light_cutoff is the spot half-angle in degrees; bourbon
+          // coneangle is the full angle. light_softness (0..1) widens the smooth
+          // falloff edge, measured inward from the outer edge.
+          const float coneangle = 2.0f * m->light_cutoff[i];
+          const float conedelta = m->light_softness[i] * m->light_cutoff[i];
+          L.source = bourbon::SpotLight::Create(
+              {.intensity = {L.intensity_value, L.intensity_unit},
+               .color = color,
+               .attenuation = attenuation,
+               .coneangle = coneangle,
+               .conedeltaangle = conedelta},
+              h, g, sg);
+        } break;
+        case mjLIGHT_POINT:
+          L.kind = bourbon::SGObjectKind::PointLight;
+          L.intensity_unit = Unit::Candela;
+          L.intensity_value = classic ? classic_candela : m->light_intensity[i];
+          L.source = bourbon::PointLight::Create(
+              {.intensity = {L.intensity_value, L.intensity_unit},
+               .color = color,
+               .attenuation = attenuation},
+              h, g, sg);
+          break;
+        default:
+          // mjLIGHT_IMAGE (and any future kinds): no source yet; keep the slot.
+          lights.push_back(std::move(L));
+          continue;
+      }
+      AttachLight(L);
+      lights.push_back(std::move(L));
+    }
+
+    // Headlight: a directional light riding the camera, pointing along the view
+    // direction (MuJoCo's headlight is directional). Its colour/enable come from
+    // vis.headlight and its transform from the camera, both updated per frame.
+    {
+      Light L;
+      L.is_headlight = true;
+      L.kind = bourbon::SGObjectKind::DistantLight;
+      L.intensity_unit = Unit::Lux;
+      L.intensity_value = kClassicDirectionalLux;
+      L.source = bourbon::DistantLight::Create(
+          {.intensity = {L.intensity_value, L.intensity_unit}}, h, g, sg);
+      AttachLight(L);
+      lights.push_back(std::move(L));
+    }
   }
 
-  // Hard-coded key + fill distant lights so the scene is neither black nor
-  // starkly single-sided (Stage 2 replaces these with the model's own lights
-  // and image-based lighting). MuJoCo is z-up; the key rakes down across a
-  // standing model and the dimmer fill lifts the opposite side.
-  void BuildLight() {
-    // Directions are toward-light vectors (see AddDistantLight). Key: a high,
-    // slightly-off-axis sun (mostly +z, MuJoCo is z-up) at clear-noon-sun
-    // illuminance, paired with the camera's sunny-16 photometric exposure so the
-    // scene lands in range.
-    AddDistantLight(Eigen::Vector3f(-0.3f, -0.5f, 1.0f), 100000.0f);
-    // Fill from the opposite side and less steep, at ~1/5 the key, to soften
-    // the shadow side without flattening the form.
-    AddDistantLight(Eigen::Vector3f(0.5f, 0.4f, 0.6f), 20000.0f);
+  // Per-frame light update: pushes each light's world placement (via its node
+  // transform) and live colour/intensity. `eye`/`forward` are the camera eye
+  // position and view direction, used to place the headlight.
+  void UpdateLights(const mjModel* m, const mjData* d,
+                    const Eigen::Vector3f& eye,
+                    const Eigen::Vector3f& forward) {
+    const int n = static_cast<int>(lights.size());
+    for (int i = 0; i < n; ++i) {
+      Light& L = lights[i];
+      if (!L.source) continue;  // image-light slot, not yet supported
+      if (L.is_headlight) {
+        const bool active = m->vis.headlight.active != 0;
+        const Eigen::Array3f rgb(m->vis.headlight.diffuse[0],
+                                 m->vis.headlight.diffuse[1],
+                                 m->vis.headlight.diffuse[2]);
+        L.xform->local_matrix().setValueIfChanged(LightFrame(eye, forward));
+        SetLightColorIntensity(L, rgb, active ? L.intensity_value : 0.0f,
+                               L.intensity_unit);
+      } else {
+        const bool active = m->light_active[i] != 0;
+        const Eigen::Array3f rgb(m->light_diffuse[3 * i + 0],
+                                 m->light_diffuse[3 * i + 1],
+                                 m->light_diffuse[3 * i + 2]);
+        L.xform->local_matrix().setValueIfChanged(
+            LightFrame(ReadVec3(d->light_xpos + 3 * i),
+                       ReadVec3(d->light_xdir + 3 * i)));
+        SetLightColorIntensity(L, rgb, active ? L.intensity_value : 0.0f,
+                               L.intensity_unit);
+      }
+    }
   }
 };
 
@@ -937,6 +1136,9 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
         bourbon::Transformation<bourbon::Space::Eye, bourbon::Space::Clip>{
             p, p.inverse()});
     s.integrator->setDepthRange(near, far);
+
+    // Update the model's lights + headlight (the headlight rides the camera).
+    s.UpdateLights(model, data, eye, fwd);
   }
 
   // --- Push per-geom world transforms into the retained scene. ---
