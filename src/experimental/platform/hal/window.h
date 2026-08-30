@@ -91,6 +91,12 @@ class Window {
   // Returns the handle to the underlying native window.
   void* GetNativeWindowHandle() { return native_window_; }
 
+  // Returns the CAMetalLayer backing the window, or nullptr if the window was
+  // not created in a Metal graphics mode. The pointer is a CA::MetalLayer* (as
+  // returned by SDL_RenderGetMetalLayer); it is returned as void* so this
+  // header stays free of Metal/QuartzCore includes on non-Metal platforms.
+  void* GetMetalLayer() { return metal_layer_; }
+
  private:
   void InitOffscreenEglContext();
 
@@ -99,6 +105,7 @@ class Window {
   float scale_ = 1.0f;
   Config config_;
   void* native_window_ = nullptr;
+  void* metal_layer_ = nullptr;
   SDL_Window* sdl_window_ = nullptr;
   SDL_Renderer* sdl_renderer_ = nullptr;
   bool should_exit_ = false;

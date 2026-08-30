@@ -44,12 +44,17 @@ enum class GraphicsMode {
 
   // Similar to FilamentOpenGl, but forces software rendering.
   FilamentOpenGlSoftware,
+
+  // The Bourbon physically-based renderer running on Metal (macOS only).
+  BourbonMetal,
 };
 
 bool IsClassic(GraphicsMode gfx_mode);
 bool IsFilament(GraphicsMode gfx_mode);
+bool IsBourbon(GraphicsMode gfx_mode);
 bool IsOpenGl(GraphicsMode gfx_mode);
 bool IsVulkan(GraphicsMode gfx_mode);
+bool IsMetal(GraphicsMode gfx_mode);
 bool IsWebGl(GraphicsMode gfx_mode);
 bool IsHeadless(GraphicsMode gfx_mode);
 bool IsSoftware(GraphicsMode gfx_mode);

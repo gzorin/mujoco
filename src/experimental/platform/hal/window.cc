@@ -97,6 +97,8 @@ Window::Window(std::string_view title, int width, int height, Config config)
     window_flags |= SDL_WINDOW_OPENGL;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+  } else if (IsMetal(config_.gfx_mode)) {
+    window_flags |= SDL_WINDOW_METAL;
   } else {
     mju_error("Unsupported window config: %d", config_.gfx_mode);
   }
@@ -128,6 +130,19 @@ Window::Window(std::string_view title, int width, int height, Config config)
   // to get the native window handle for the renderer.
   if (IsHeadless(config_.gfx_mode)) {
     sdl_renderer_ = SDL_CreateRenderer(sdl_window_, -1, SDL_RENDERER_SOFTWARE);
+  } else if (IsMetal(config_.gfx_mode)) {
+    // Bourbon renders directly into the CAMetalLayer's drawables and manages its
+    // own device/queue/swapchain, so SDL is only used to obtain the layer.
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
+    sdl_renderer_ = SDL_CreateRenderer(sdl_window_, -1, SDL_RENDERER_PRESENTVSYNC);
+    if (!sdl_renderer_) {
+      mju_error("Error creating Metal renderer: %s", SDL_GetError());
+    }
+    metal_layer_ = SDL_RenderGetMetalLayer(sdl_renderer_);
+    if (!metal_layer_) {
+      mju_error("Error obtaining Metal layer from SDL renderer: %s",
+                SDL_GetError());
+    }
   } else {
     SDL_SysWMinfo wmi;
     SDL_VERSION(&wmi.version);
@@ -251,7 +266,8 @@ void Window::Present(std::span<const std::byte> pixels) {
 
     SDL_RenderPresent(sdl_renderer_);
   } else if (config_.gfx_mode != GraphicsMode::FilamentVulkan &&
-             config_.gfx_mode != GraphicsMode::FilamentOpenGl) {
+             config_.gfx_mode != GraphicsMode::FilamentOpenGl &&
+             !IsMetal(config_.gfx_mode)) {
     SDL_GL_SwapWindow(sdl_window_);
   }
 }

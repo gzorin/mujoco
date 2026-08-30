@@ -34,6 +34,14 @@ bool IsFilament(GraphicsMode gfx_mode) {
          gfx_mode == GraphicsMode::FilamentOpenGlSoftware;
 }
 
+bool IsBourbon(GraphicsMode gfx_mode) {
+  return gfx_mode == GraphicsMode::BourbonMetal;
+}
+
+bool IsMetal(GraphicsMode gfx_mode) {
+  return gfx_mode == GraphicsMode::BourbonMetal;
+}
+
 bool IsOpenGl(GraphicsMode gfx_mode) {
   return gfx_mode == GraphicsMode::ClassicOpenGl ||
          gfx_mode == GraphicsMode::ClassicOpenGlHeadless ||
@@ -80,6 +88,16 @@ GraphicsMode GraphicsModeFromString(std::string_view str,
     return GraphicsMode::FilamentOpenGlHeadless;
   } else if (str == "opengl_software") {
     return GraphicsMode::FilamentOpenGlSoftware;
+  } else if (str == "bourbon" || str == "metal") {
+#if defined(MUJOCO_USE_BOURBON)
+    return GraphicsMode::BourbonMetal;
+#else
+    mju_error(
+        "Graphics mode '%s' requires a build with the Bourbon renderer "
+        "(configure with -DMUJOCO_USE_BOURBON=ON on macOS).",
+        str.data());
+    return default_mode;
+#endif
   } else if (str.empty()) {
     return default_mode;
   } else {
