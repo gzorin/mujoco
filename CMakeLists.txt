@@ -49,6 +49,9 @@ if(NOT EMSCRIPTEN)
   option(MUJOCO_USE_FILAMENT "Use filament rendering" OFF)
   # Allows filament renderer to be used with mjr API; disables src/render to prevent conflicts.
   option(MUJOCO_USE_FILAMENT_MJR_COMPAT "Use filament mjr compatibility layer" OFF)
+  if(APPLE)
+    option(MUJOCO_USE_BOURBON "Use the Bourbon Metal renderer (macOS only)" OFF)
+  endif()
 endif()
 
 if(EMSCRIPTEN)
@@ -178,6 +181,36 @@ if(MUJOCO_USE_FILAMENT)
   if(MUJOCO_USE_FILAMENT_MJR_COMPAT)
     add_subdirectory(src/experimental/filament)
   endif()
+endif()
+
+# Bourbon Metal renderer (macOS only). Bourbon is not fetched: its two-stage
+# LLVM/LLAIR/MaterialX dependency build is far too heavy to nest inside MuJoCo's
+# configure, so it must be installed separately (see src/render/bourbon) and
+# located via CMAKE_PREFIX_PATH (e.g. -DCMAKE_PREFIX_PATH=/usr/local/bourbon).
+if(MUJOCO_USE_BOURBON)
+  if(NOT APPLE)
+    message(FATAL_ERROR "MUJOCO_USE_BOURBON requires macOS (Bourbon is Metal-only).")
+  endif()
+  find_package(Bourbon REQUIRED CONFIG)
+  # llair::setPathToTools needs the directory containing the Metal toolchain
+  # (metal, metallib, ...) at runtime; discover it here and pass it through as a
+  # compile definition, overridable at runtime via MUJOCO_BOURBON_LLAIR_TOOLS.
+  # The Metal compiler lives in an xcrun-resolved toolchain path that is not on
+  # the default PATH, so plain find_program() cannot locate it.
+  execute_process(
+    COMMAND xcrun -f metal
+    OUTPUT_VARIABLE MUJOCO_METAL_TOOL
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE MUJOCO_METAL_TOOL_RESULT)
+  if(NOT MUJOCO_METAL_TOOL_RESULT EQUAL 0 OR NOT MUJOCO_METAL_TOOL)
+    message(FATAL_ERROR
+      "MUJOCO_USE_BOURBON: could not locate the 'metal' tool via 'xcrun -f metal'. "
+      "Install the Xcode Metal toolchain (xcodebuild -downloadComponent MetalToolchain).")
+  endif()
+  get_filename_component(MUJOCO_METAL_TOOLS_PATH "${MUJOCO_METAL_TOOL}" DIRECTORY)
+  message(STATUS "MuJoCo Bourbon: Metal tools path = ${MUJOCO_METAL_TOOLS_PATH}")
+  add_subdirectory(src/render/bourbon)
+  list(APPEND MUJOCO_PLATFORM_RENDER_DEPS mujoco::render_bourbon)
 endif()
 
 if(EMSCRIPTEN)

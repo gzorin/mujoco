@@ -1,0 +1,10 @@
+The MuJoCo Bourbon renderer backend was developed against the following bourbon
+commit. Bourbon's API is under active development; if you hit build failures in
+src/render/bourbon after updating bourbon, this is the reference revision.
+
+bourbon git SHA: b842705148c67d46c4843f1d6b9be0a40cd23ad6
+(branch merge: "tessellation-shape-improvements" / "sdf-revisions")
+
+Bourbon must be built and installed separately (it is not fetched by MuJoCo's
+configure). Point MuJoCo at it with -DCMAKE_PREFIX_PATH=/usr/local/bourbon and
+configure with -DMUJOCO_USE_BOURBON=ON (macOS only).

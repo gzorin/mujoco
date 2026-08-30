@@ -41,6 +41,9 @@
 #if defined(MUJOCO_USE_FILAMENT)
 #include "experimental/platform/hal/filament_renderer.h"
 #endif
+#if defined(MUJOCO_USE_BOURBON)
+#include "experimental/platform/hal/bourbon_renderer.h"
+#endif
 #include "experimental/platform/hal/graphics_mode.h"
 #include "experimental/platform/hal/renderer.h"
 #include "experimental/platform/hal/window.h"
@@ -137,6 +140,11 @@ void App::SwitchGraphicsMode(int width, int height,
   } else if (platform::IsFilament(gfx_mode_)) {
     renderer_ = std::make_unique<platform::FilamentRenderer>(
         window_->GetNativeWindowHandle(), gfx_mode_);
+#endif
+#if defined(MUJOCO_USE_BOURBON)
+  } else if (platform::IsBourbon(gfx_mode_)) {
+    renderer_ = std::make_unique<platform::BourbonRenderer>(
+        window_->GetMetalLayer(), gfx_mode_);
 #endif
   } else {
     mju_error(

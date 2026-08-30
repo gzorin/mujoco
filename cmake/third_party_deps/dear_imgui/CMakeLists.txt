@@ -64,6 +64,29 @@ target_sources(dear_imgui_OpenGL3
     ${MUJOCO_DEAR_IMGUI_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+# Metal backend (macOS only). Mirrors dear_imgui_OpenGL3, building the upstream
+# Objective-C++ Metal backend and linking the required system frameworks.
+if(APPLE)
+  add_library(dear_imgui_Metal STATIC)
+  target_include_directories(dear_imgui_Metal
+    PUBLIC
+      ${MUJOCO_DEAR_IMGUI_SOURCE_DIR}
+  )
+  target_sources(dear_imgui_Metal
+    PRIVATE
+      ${MUJOCO_DEAR_IMGUI_SOURCE_DIR}/backends/imgui_impl_metal.h
+      ${MUJOCO_DEAR_IMGUI_SOURCE_DIR}/backends/imgui_impl_metal.mm
+  )
+  set_source_files_properties(
+    ${MUJOCO_DEAR_IMGUI_SOURCE_DIR}/backends/imgui_impl_metal.mm
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  target_link_libraries(dear_imgui_Metal
+    dear_imgui
+    "-framework Metal"
+    "-framework QuartzCore"
+    "-framework Foundation")
+endif()
+
 # stdlib
 add_library(dear_imgui_stdlib STATIC)
 target_include_directories(dear_imgui_stdlib

@@ -85,6 +85,20 @@ if(MUJOCO_USE_FILAMENT)
         PUBLIC MUJOCO_USE_FILAMENT)
 endif()
 
+# The Bourbon (Metal) renderer. bourbon_renderer.cc talks only to
+# BourbonContext (a PIMPL that keeps all bourbon:: types out of this library's
+# translation units); the render_bourbon static library is linked via
+# MUJOCO_PLATFORM_RENDER_DEPS from the root CMakeLists.txt.
+if(MUJOCO_USE_BOURBON)
+    target_sources(${MUJOCO_PLATFORM_TARGET_NAME}
+        PRIVATE
+            hal/bourbon_renderer.cc
+            hal/bourbon_renderer.h
+    )
+    target_compile_definitions(${MUJOCO_PLATFORM_TARGET_NAME}
+        PUBLIC MUJOCO_USE_BOURBON)
+endif()
+
 if(APPLE)
     set_source_files_properties(hal/window_osx.mm PROPERTIES
         COMPILE_FLAGS "-x objective-c++")
