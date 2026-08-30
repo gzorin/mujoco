@@ -47,10 +47,12 @@ class BourbonContext {
   // Sets the background clear colour (linear, 0..1).
   void SetClearColor(float r, float g, float b, float a);
 
-  // Renders one frame: clears the drawable and draws the current ImGui frame on
-  // top, then presents. Owns the ImGui::Render() call. The caller must have
-  // built the ImGui frame (ImGui::NewFrame ... widgets) beforehand.
-  void RenderFrame();
+  // Renders one frame: updates the camera from `camera`, evaluates the bourbon
+  // scene/pass graph into the drawable, draws the current ImGui frame on top,
+  // then presents. Owns the ImGui::Render() call. The caller must have built the
+  // ImGui frame (ImGui::NewFrame ... widgets) beforehand.
+  void RenderFrame(const mjModel* model, mjData* data, mjvCamera* camera,
+                   int width, int height);
 
   // Frames-per-second, exponentially smoothed.
   double GetFps() const;

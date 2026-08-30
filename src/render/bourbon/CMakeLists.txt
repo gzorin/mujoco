@@ -34,6 +34,22 @@ target_include_directories(render_bourbon
     ${PROJECT_SOURCE_DIR}/src
 )
 
+# This library exchanges Eigen types (Affine3f, Transformation, ...) with the
+# bourbon dylibs, so it must compile against the exact Eigen bourbon was built
+# with — not MuJoCo's fetched Eigen. Prepend bourbon's Eigen so every <Eigen/*>
+# in this library resolves to it (ABI-compatible, and avoids stricter-Eigen
+# instantiation errors in bourbon's headers). Derived from an imported target's
+# location so it tracks CMAKE_PREFIX_PATH.
+get_target_property(_bourbon_core_loc0 Bourbon::BourbonCore IMPORTED_LOCATION_RELEASE)
+if(NOT _bourbon_core_loc0)
+  get_target_property(_bourbon_core_loc0 Bourbon::BourbonCore IMPORTED_LOCATION)
+endif()
+get_filename_component(_bourbon_prefix "${_bourbon_core_loc0}/../.." ABSOLUTE)
+if(EXISTS "${_bourbon_prefix}/include/eigen3")
+  target_include_directories(render_bourbon BEFORE PRIVATE
+    "${_bourbon_prefix}/include/eigen3")
+endif()
+
 target_compile_features(render_bourbon PUBLIC cxx_std_20)
 
 target_link_libraries(render_bourbon
