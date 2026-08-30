@@ -34,23 +34,69 @@ target_include_directories(render_bourbon
     ${PROJECT_SOURCE_DIR}/src
 )
 
-# This library exchanges Eigen types (Affine3f, Transformation, ...) with the
-# bourbon dylibs, so it must compile against the exact Eigen bourbon was built
-# with — not MuJoCo's fetched Eigen. Prepend bourbon's Eigen so every <Eigen/*>
-# in this library resolves to it (ABI-compatible, and avoids stricter-Eigen
-# instantiation errors in bourbon's headers). Derived from an imported target's
-# location so it tracks CMAKE_PREFIX_PATH.
-get_target_property(_bourbon_core_loc0 Bourbon::BourbonCore IMPORTED_LOCATION_RELEASE)
-if(NOT _bourbon_core_loc0)
-  get_target_property(_bourbon_core_loc0 Bourbon::BourbonCore IMPORTED_LOCATION)
+# Locate the bourbon install prefix from an imported target's on-disk location,
+# config-agnostically (a Debug-only install sets IMPORTED_LOCATION_DEBUG, not
+# _RELEASE), so this works whether bourbon was installed Debug or Release.
+get_target_property(_bourbon_cfgs Bourbon::BourbonCore IMPORTED_CONFIGURATIONS)
+set(_bourbon_core_loc "")
+if(_bourbon_cfgs)
+  list(GET _bourbon_cfgs 0 _bourbon_cfg0)
+  get_target_property(_bourbon_core_loc Bourbon::BourbonCore
+                      IMPORTED_LOCATION_${_bourbon_cfg0})
 endif()
-get_filename_component(_bourbon_prefix "${_bourbon_core_loc0}/../.." ABSOLUTE)
-if(EXISTS "${_bourbon_prefix}/include/eigen3")
-  target_include_directories(render_bourbon BEFORE PRIVATE
-    "${_bourbon_prefix}/include/eigen3")
+if(NOT _bourbon_core_loc)
+  get_target_property(_bourbon_core_loc Bourbon::BourbonCore IMPORTED_LOCATION)
 endif()
+if(NOT _bourbon_core_loc)
+  message(FATAL_ERROR "render_bourbon: could not resolve Bourbon::BourbonCore "
+                      "imported location (configs: ${_bourbon_cfgs}).")
+endif()
+get_filename_component(_bourbon_libdir "${_bourbon_core_loc}" DIRECTORY)
+get_filename_component(_bourbon_prefix "${_bourbon_libdir}/.." ABSOLUTE)
+
+# This library exchanges Eigen types (Affine3f, Transformation, Array4f, ...)
+# with the bourbon dylibs BY VALUE, so it MUST compile against the exact Eigen
+# tree bourbon's dylibs were built against. A different Eigen build silently
+# changes how fixed-size Eigen types are passed across the ABI boundary (e.g.
+# Array4f in FP registers vs a GP register / memory), shifting the pointer
+# arguments that follow and corrupting the call.
+#
+# Bourbon (per its compile_commands.json) builds against Homebrew's Eigen at
+# /opt/homebrew/include/eigen3 — NOT the eigen3 copied into its own install
+# prefix, and NOT MuJoCo's fetched Eigen. Default to that, overridable if
+# bourbon was built elsewhere.
+set(MUJOCO_BOURBON_EIGEN_DIR "/opt/homebrew/include/eigen3" CACHE PATH
+    "Eigen include dir that bourbon's dylibs were compiled against. Must match \
+exactly to avoid an Eigen ABI mismatch across the bourbon boundary.")
+if(NOT EXISTS "${MUJOCO_BOURBON_EIGEN_DIR}/Eigen/Core")
+  # Fall back to the eigen shipped in bourbon's install prefix.
+  if(EXISTS "${_bourbon_prefix}/include/eigen3/Eigen/Core")
+    set(MUJOCO_BOURBON_EIGEN_DIR "${_bourbon_prefix}/include/eigen3")
+  else()
+    message(FATAL_ERROR "render_bourbon: could not find the Eigen tree bourbon "
+      "was built against. Set MUJOCO_BOURBON_EIGEN_DIR to it (check bourbon's "
+      "build compile_commands.json for the -isystem .../eigen3 path).")
+  endif()
+endif()
+message(STATUS "render_bourbon: using bourbon-matched Eigen at ${MUJOCO_BOURBON_EIGEN_DIR}")
+target_include_directories(render_bourbon BEFORE PRIVATE
+  "${MUJOCO_BOURBON_EIGEN_DIR}")
 
 target_compile_features(render_bourbon PUBLIC cxx_std_20)
+
+# Bourbon's DG type system identifies non-trivial value types by the ADDRESS of
+# an `inline constexpr` template variable (bourbon::detail::dgtype_tag<T>), and
+# type-checks DG connections by comparing those addresses across the DSO
+# boundary. MuJoCo builds with hidden visibility (CMAKE_CXX_VISIBILITY_PRESET
+# hidden + VISIBILITY_INLINES_HIDDEN), which would give this library its own
+# hidden copy of that variable — a different address than bourbon's dylib, so
+# connect() would (correctly, from its view) reject every connection as a type
+# mismatch. Bourbon and its examples build with default visibility; match that
+# here so the weak template instantiations coalesce with bourbon's at load time.
+set_target_properties(render_bourbon PROPERTIES
+  C_VISIBILITY_PRESET default
+  CXX_VISIBILITY_PRESET default
+  VISIBILITY_INLINES_HIDDEN OFF)
 
 target_link_libraries(render_bourbon
   PUBLIC
@@ -73,16 +119,9 @@ target_compile_definitions(render_bourbon PRIVATE
   MUJOCO_BOURBON_LLAIR_TOOLS_PATH="${MUJOCO_METAL_TOOLS_PATH}")
 
 # The bourbon libraries are imported SHARED targets linked as @rpath/... . Add
-# their install directory to the runtime search path of any executable that
-# links this library (propagated as an INTERFACE link option through the static
-# platform library to the studio executable).
-get_target_property(_bourbon_core_loc Bourbon::BourbonCore IMPORTED_LOCATION_RELEASE)
-if(NOT _bourbon_core_loc)
-  get_target_property(_bourbon_core_loc Bourbon::BourbonCore IMPORTED_LOCATION)
-endif()
-if(_bourbon_core_loc)
-  get_filename_component(_bourbon_libdir "${_bourbon_core_loc}" DIRECTORY)
-  target_link_options(render_bourbon INTERFACE "-Wl,-rpath,${_bourbon_libdir}")
-endif()
+# their install directory (resolved above) to the runtime search path of any
+# executable that links this library (propagated as an INTERFACE link option
+# through the static platform library to the studio executable).
+target_link_options(render_bourbon INTERFACE "-Wl,-rpath,${_bourbon_libdir}")
 
 add_library(mujoco::render_bourbon ALIAS render_bourbon)

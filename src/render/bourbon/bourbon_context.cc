@@ -17,7 +17,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <memory_resource>
 #include <utility>
+#include <vector>
 
 #include <imgui.h>
 
@@ -48,9 +50,19 @@
 #include <BourbonTG/TaskGraphEvaluator.h>
 
 #include <BourbonSG/Camera.h>
+#include <BourbonSG/LightSource.h>
+#include <BourbonSG/LightSources/DistantLight.h>
+#include <BourbonSG/Material.h>
+#include <BourbonSG/MatrixTransformer.h>
 #include <BourbonSG/Model.h>
+#include <BourbonSG/Pattern.h>
 #include <BourbonSG/Projections/MatrixProjection.h>
 #include <BourbonSG/SGContext.h>
+#include <BourbonSG/SGNode.h>
+#include <BourbonSG/ShapeInstance.h>
+#include <BourbonSG/Shapes/SDF3D.h>
+
+#include <BourbonCore/Token.h>
 
 #include <BourbonRenderer/RendererContext.h>
 #include <BourbonRenderer/World/BXDFIntegrationPipelines.h>
@@ -112,6 +124,36 @@ bourbon::DeviceImage<2>::Extent ToExtent(CGSize size) {
                                          static_cast<unsigned>(size.height)};
 }
 
+// A retained scene element: an owned SGNode with a rigid transform, a shared
+// shape, and a material. Sizes are baked into the shape's parameters and the
+// node transform is kept strictly rigid (rotation + translation), which is
+// required for the ray-marched SDF primitives (a node scale would break their
+// distance field; see the plan's R2).
+struct Renderable {
+  bourbon::SGNode* node = nullptr;  // owned by world->model()
+  bourbon::RefPtr<bourbon::MatrixTransformer> xform;
+  bourbon::RefPtr<bourbon::Shape> shape;
+  bourbon::RefPtr<bourbon::Material> material;
+};
+
+// Builds a rigid object->world transform from a MuJoCo position (3) and a
+// row-major 3x3 orientation (mjData::geom_xmat is row-major). Eigen's comma
+// initializer fills row-major, so this loads geom_xmat without transposing.
+Eigen::Affine3f GeomAffine(const mjtNum* pos, const mjtNum* xmat) {
+  Eigen::Matrix3f r;
+  r << static_cast<float>(xmat[0]), static_cast<float>(xmat[1]),
+      static_cast<float>(xmat[2]), static_cast<float>(xmat[3]),
+      static_cast<float>(xmat[4]), static_cast<float>(xmat[5]),
+      static_cast<float>(xmat[6]), static_cast<float>(xmat[7]),
+      static_cast<float>(xmat[8]);
+  Eigen::Affine3f a = Eigen::Affine3f::Identity();
+  a.linear() = r;
+  a.translation() = Eigen::Vector3f(static_cast<float>(pos[0]),
+                                    static_cast<float>(pos[1]),
+                                    static_cast<float>(pos[2]));
+  return a;
+}
+
 }  // namespace
 
 struct BourbonContext::Impl {
@@ -161,6 +203,14 @@ struct BourbonContext::Impl {
   const mjModel* model = nullptr;
   Eigen::Array4f clear_color = {0.12f, 0.14f, 0.18f, 1.0f};
 
+  // Retained scene: one entry per model geom (size ngeom; entries for
+  // unsupported geom types have a null node). Plus a shared flat material and a
+  // single hard-coded distant light (Stage 1).
+  std::vector<Renderable> geoms;
+  bourbon::RefPtr<bourbon::Material> default_material;
+  bourbon::SGNode* light_node = nullptr;
+  bourbon::RefPtr<bourbon::DistantLight> light;
+
   std::chrono::steady_clock::time_point last_frame;
   bool have_last_frame = false;
   double fps = 0.0;
@@ -206,6 +256,123 @@ struct BourbonContext::Impl {
         extent, swapchain->format(), drawable_source->output(),
         integrator->output(), *camera, *render_graph, *renderer_context);
   }
+
+  // Maps a MuJoCo geom to a bourbon SDF primitive, with sizes baked in from
+  // mjModel::geom_size (index 1 is the half-length for capsule/cylinder). Ray-
+  // marched SDFs require rigid node transforms, so all sizing lives here, never
+  // in the node scale. Returns null for geom types not yet supported (plane,
+  // mesh, hfield, ...).
+  bourbon::RefPtr<bourbon::Shape> MakeShapeForGeom(const mjModel* m, int i) {
+    const mjtNum* size = m->geom_size + 3 * i;
+    const float a = static_cast<float>(size[0]);
+    const float b = static_cast<float>(size[1]);
+    const float c = static_cast<float>(size[2]);
+    bourbon::TaskHeap& h = *model_heap;
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::SGContext& sg = *sg_context;
+    switch (m->geom_type[i]) {
+      case mjGEOM_SPHERE:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::SphereParams{.radius = a}, h, g, sg);
+      case mjGEOM_CAPSULE:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::CapsuleParams{.radius = a, .height = 2.0f * b}, h, g,
+            sg);
+      case mjGEOM_CYLINDER:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::CylinderParams{.radius = a, .height = 2.0f * b}, h,
+            g, sg);
+      case mjGEOM_BOX:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::CubeParams{
+                .width = 2.0f * a, .height = 2.0f * b, .depth = 2.0f * c},
+            h, g, sg);
+      case mjGEOM_ELLIPSOID:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::EllipsoidParams{
+                .radius_x = a, .radius_y = b, .radius_z = c},
+            h, g, sg);
+      default:
+        return {};  // plane, mesh, hfield, etc.: later stages.
+    }
+  }
+
+  // Removes all retained scene nodes (geoms + light) from the world model.
+  void ClearScene() {
+    if (world) {
+      world->model().destroyAllRootNodes();
+    }
+    geoms.clear();
+    light_node = nullptr;
+    light.reset();
+    default_material.reset();
+  }
+
+  // Builds the retained scene for `m`: a shared flat material, one node/shape
+  // per supported geom (transforms updated per frame), and one distant light.
+  void BuildScene(const mjModel* m) {
+    model = m;
+    if (!m) return;
+    bourbon::TaskHeap& h = *model_heap;
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::SGContext& sg = *sg_context;
+    bourbon::Model& scene = world->model();
+
+    // Shared flat glTF-PBR material (Stage 3 replaces this with per-material
+    // scalars/textures).
+    const auto* bxdf =
+        renderer_context->findBXDF(bourbon::Token::Get("glTFPbrBXDF"));
+    const auto* pattern =
+        renderer_context->findPattern(bourbon::Token::Get("glTFPbrPattern"));
+    Eigen::Array4f base_color = {0.75f, 0.75f, 0.75f, 1.0f};
+    bourbon::Pattern::Params params = {
+        {bourbon::Token::Get("baseColor"), &base_color}};
+    default_material = bourbon::Material::Create(
+        bxdf,
+        bourbon::Pattern::Create(*pattern, params, {},
+                                 bourbon::SemiTransparencyKind::Opaque, h, g,
+                                 sg),
+        h, g, sg);
+
+    geoms.assign(m->ngeom, Renderable{});
+    for (int i = 0; i < m->ngeom; ++i) {
+      bourbon::RefPtr<bourbon::Shape> shape = MakeShapeForGeom(m, i);
+      if (!shape) continue;
+      bourbon::SGNode* node = scene.createNode();
+      scene.addRootNode(*node);
+      auto xform = bourbon::MatrixTransformer::Create(g);
+      node->setTransformer(xform);
+      node->addShape(shape, default_material, h, g, sg);
+      geoms[i].node = node;
+      geoms[i].xform = xform;
+      geoms[i].shape = shape;
+      geoms[i].material = default_material;
+    }
+
+    BuildLight();
+  }
+
+  // A single hard-coded distant light so the scene is not rendered black
+  // (Stage 2 replaces this with the model's lights).
+  void BuildLight() {
+    bourbon::TaskHeap& h = *model_heap;
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::SGContext& sg = *sg_context;
+    bourbon::Model& scene = world->model();
+
+    bourbon::DistantLight::Params p;
+    p.intensity = {3.0f, bourbon::LightSource::Intensity::Unit::Lux};
+    // Colour defaults to unit-luminance white RGB.
+    p.from = bourbon::Point<bourbon::Space::Object>{0.0f, 0.0f, 0.0f, 1.0f};
+    // Light travels down and slightly to the side (MuJoCo is z-up).
+    p.to = bourbon::Point<bourbon::Space::Object>{0.3f, 0.3f, -1.0f, 1.0f};
+    light = bourbon::DistantLight::Create(p, h, g, sg);
+
+    light_node = scene.createNode();
+    light_node->setTransformer(bourbon::MatrixTransformer::Create(g));
+    light_node->addLightSource(light, h, g, sg);
+    scene.addRootNode(*light_node);
+  }
 };
 
 BourbonContext::BourbonContext(void* metal_layer)
@@ -231,11 +398,16 @@ BourbonContext::BourbonContext(void* metal_layer)
   s.swapchain = bourbon::Swapchain::Create(s.metal_layer, *s.core);
   s.queue = s.core->getCommandQueue();
 
-  // Model + render graphs, evaluators, and heaps.
-  s.model_graph = bourbon::TaskGraph::Create(*s.core);
+  // Model + render graphs, evaluators, and heaps. TaskGraph::Create does NOT
+  // synthesize a fallback allocator when passed nullptr, so an explicit
+  // memory_resource is required; new_delete_resource is an unbounded static
+  // singleton (no lifetime management needed).
+  s.model_graph =
+      bourbon::TaskGraph::Create(*s.core, std::pmr::new_delete_resource());
   s.model_graph_evaluator = bourbon::TaskGraphEvaluator::Create(*s.model_graph);
   s.model_heap = std::make_unique<bourbon::PersistentHeap>(*s.core);
-  s.render_graph = bourbon::TaskGraph::Create(*s.core);
+  s.render_graph =
+      bourbon::TaskGraph::Create(*s.core, std::pmr::new_delete_resource());
   s.render_graph_evaluator =
       bourbon::TaskGraphEvaluator::Create(*s.render_graph);
   s.render_heap = std::make_unique<bourbon::PersistentHeap>(*s.core);
@@ -292,8 +464,8 @@ BourbonContext::~BourbonContext() {
 
 void BourbonContext::Init(const mjModel* model) {
   impl_->DrainGpu();
-  impl_->model = model;
-  // Stage 1 builds the retained scene (shapes/nodes) here.
+  impl_->ClearScene();
+  impl_->BuildScene(model);
 }
 
 void BourbonContext::SetClearColor(float r, float g, float b, float a) {
@@ -354,6 +526,16 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
         bourbon::Transformation<bourbon::Space::Eye, bourbon::Space::Clip>{
             p, p.inverse()});
     s.integrator->setDepthRange(near, far);
+  }
+
+  // --- Push per-geom world transforms into the retained scene. ---
+  if (model != nullptr && data != nullptr) {
+    const int n = static_cast<int>(s.geoms.size());
+    for (int i = 0; i < n; ++i) {
+      if (!s.geoms[i].node) continue;
+      s.geoms[i].xform->local_matrix().setValueIfChanged(
+          GeomAffine(data->geom_xpos + 3 * i, data->geom_xmat + 9 * i));
+    }
   }
 
   // --- Evaluate the model (scene state) graph. ---
