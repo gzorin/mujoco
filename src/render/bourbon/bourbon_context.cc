@@ -65,6 +65,11 @@
 #include <BourbonSG/SGContext.h>
 #include <BourbonSG/SGNode.h>
 #include <BourbonSG/SGObjectKind.h>
+#include <BourbonSG/ShadowFilter.h>
+#include <BourbonSG/ShadowSource.h>
+#include <BourbonSG/ShadowSourceInstance.h>
+#include <BourbonSG/ShadowSources/CubeShadow.h>
+#include <BourbonSG/ShadowSources/DirectionalShadow.h>
 #include <BourbonSG/ShapeInstance.h>
 #include <BourbonSG/ShapeVar.h>
 #include <BourbonSG/ShapeVarKind.h>
@@ -159,6 +164,20 @@ struct Light {
   bourbon::LightSource::Intensity::Unit intensity_unit =
       bourbon::LightSource::Intensity::Unit::Lux;
   bool is_headlight = false;
+
+  // Shadow state. A shadow source is attached to this same node (so it inherits
+  // the light's placement frame) on demand and removed when shadows are turned
+  // off; `casts_shadow` gates that from light_castshadow. Projection params are
+  // baked at construction of the ShadowSource (they are NOT DGInputs), so they
+  // are computed once at build and cached here.
+  bool casts_shadow = false;
+  bourbon::RefPtr<bourbon::ShadowSource> shadow;
+  bourbon::ShadowSourceInstance* shadow_instance = nullptr;
+  unsigned shadow_size = 1024;
+  float shadow_near = 0.01f;
+  float shadow_far = 100.0f;
+  float shadow_coverage = 1.0f;  // directional ortho half-extent (width=height=2x)
+  float shadow_coneangle = 180.0f;  // spot shadow full cone angle (degrees)
 };
 
 // Classic-scene fallback illumination (used when a model authors no physical
@@ -541,6 +560,11 @@ struct BourbonContext::Impl {
   std::unique_ptr<bourbon::TaskGraph> render_graph;
   std::unique_ptr<bourbon::TaskGraphEvaluator> render_graph_evaluator;
   std::unique_ptr<bourbon::PersistentHeap> render_heap;
+  // Persistent heap for the pass-graph tasks' construction-time allocations
+  // (integrator, ShadowTask cull buffers, render-target rings, ...). Allocated
+  // once and never freed per frame, unlike render_heap (per-frame eval scratch),
+  // so those buffers are not reclaimed underneath the tasks.
+  std::unique_ptr<bourbon::PersistentHeap> pass_heap;
 
   std::unique_ptr<bourbon::World> world;
 
@@ -559,6 +583,29 @@ struct BourbonContext::Impl {
   std::unique_ptr<bourbon::ForwardIntegrator> integrator;
   std::unique_ptr<bourbon::ResolveTask> resolve_task;
   bourbon::Timestamp prior_render_signal{};
+
+  // Structural pass-graph key: the pass graph is rebuilt when the draw-
+  // submission mode or the set of shadow sources changes. Shadows are only
+  // producible in a non-Direct mode (shadowDraws() is null in Direct), and the
+  // shadow task bakes one encode chain per shadow source at construction, so an
+  // add/remove of a shadow source (reflected in shadow_source_morphology) is
+  // structural. `built_valid` is false until the first build.
+  bool built_valid = false;
+  bourbon::DrawSubmission::Mode built_mode = bourbon::DrawSubmission::Mode::Direct;
+  uint64_t built_shadow_morphology = 0;
+
+  // Whether IndirectDraws' persistent device buffer has been produced by at
+  // least one shadowless render drain. IndirectDraws produces that buffer only
+  // in its "stage 1", gated on shape_kind_morphology being dirty -- which is the
+  // first frame shapes appear. The shadow task's cull binds that buffer but is
+  // NOT batch-ordered after IndirectDraws (its ordering is via .modifies(),
+  // which is not a real graph edge), so if a shadow sweep coincides with the
+  // frame stage 1 first runs, the cull reads the not-yet-produced (null) buffer
+  // and asserts. So we force the first render drain after a (re)build to run
+  // shadowless; the buffer it produces persists across frames, and shape
+  // morphology is then clean, so subsequent shadow sweeps never re-trigger
+  // stage 1. Reset on Init so a model reload re-primes.
+  bool primed = false;
 
   // A LoadAction=Load framebuffer used to overlay ImGui on the resolved image.
   std::unique_ptr<bourbon::Framebuffer> ui_framebuffer;
@@ -592,7 +639,12 @@ struct BourbonContext::Impl {
     fence->metal_command_buffer()->waitUntilCompleted();
   }
 
-  void BuildPassGraph() {
+  void BuildPassGraph(bourbon::DrawSubmission::Mode mode) {
+    // The integrator captures draws()/shadowDraws() for the current mode at
+    // construction, so select it before building. shadowDraws() is non-null
+    // only in a non-Direct mode.
+    draw_submission->setMode(mode);
+
     bourbon::DeviceImage<2>::Extent extent = ToExtent(swapchain->extent());
 
     clear_task = bourbon::ClearFramebufferTask::Create(
@@ -616,7 +668,7 @@ struct BourbonContext::Impl {
     integrator = bourbon::ForwardIntegrator::Create(
         clear_task->color(), camera.get(), world.get(),
         draw_submission->draws(), draw_submission->shadowDraws(),
-        bxdf_pipelines.get(), forward_viz, integrator_params, *render_heap,
+        bxdf_pipelines.get(), forward_viz, integrator_params, *pass_heap,
         *render_graph, *queue, *renderer_context);
 
     drawable_source = std::make_unique<DrawableImageSource>(*render_graph);
@@ -624,6 +676,29 @@ struct BourbonContext::Impl {
     resolve_task = bourbon::ResolveTask::Create(
         extent, swapchain->format(), drawable_source->output(),
         integrator->output(), *camera, *render_graph, *renderer_context);
+
+    built_mode = mode;
+    built_valid = true;
+  }
+
+  // Tears down and rebuilds the pass graph for a new draw-submission mode or
+  // shadow morphology. The prior pass-graph GPU work may still be in flight, so
+  // drain first (the trailing-fence idiom); then destroy the tasks in reverse
+  // dependency order before recreating them in the same (surviving) render
+  // graph. `shadow_morphology` is recorded so the caller's key check settles.
+  void RebuildPassGraph(bourbon::DrawSubmission::Mode mode,
+                        uint64_t shadow_morphology) {
+    DrainGpu();
+    resolve_task.reset();
+    integrator.reset();
+    drawable_source.reset();
+    clear_task.reset();
+    // The old tasks' pass-heap allocations are now safe to reclaim (GPU drained
+    // above); free and re-commit for the rebuilt tasks.
+    pass_heap->free();
+    BuildPassGraph(mode);
+    pass_heap->allocate();
+    built_shadow_morphology = shadow_morphology;
   }
 
   // Uploads a host triangle soup as a bourbon TriangleMesh Shape, deriving
@@ -860,6 +935,19 @@ struct BourbonContext::Impl {
     for (int i = 0; i < m->nlight; ++i) total_intensity += m->light_intensity[i];
     const bool classic = total_intensity <= 0.0f;
 
+    // Shadow projection parameters (baked into each ShadowSource at creation --
+    // they are not DGInputs). Mirrors the classic/prior renderer: the shadow-map
+    // near/far track the model's camera clip range, the directional ortho half-
+    // extent is shadowclip*extent, and the spot shadow FOV is
+    // 2*cutoff*shadowscale. Shadow-map size is clamped to a safe cap.
+    const float extent = std::max(static_cast<float>(m->stat.extent), 1e-3f);
+    const float shadow_near = extent * static_cast<float>(m->vis.map.znear);
+    const float shadow_far = extent * static_cast<float>(m->vis.map.zfar);
+    const float shadow_coverage = extent * static_cast<float>(m->vis.map.shadowclip);
+    const unsigned shadow_size =
+        static_cast<unsigned>(std::min(m->vis.quality.shadowsize, 4096));
+    const float shadowscale = static_cast<float>(m->vis.map.shadowscale);
+
     using Unit = bourbon::LightSource::Intensity::Unit;
     lights.clear();
     lights.reserve(m->nlight + 1);
@@ -921,6 +1009,12 @@ struct BourbonContext::Impl {
           lights.push_back(std::move(L));
           continue;
       }
+      L.casts_shadow = m->light_castshadow[i] != 0;
+      L.shadow_size = shadow_size;
+      L.shadow_near = shadow_near;
+      L.shadow_far = shadow_far;
+      L.shadow_coverage = shadow_coverage;
+      L.shadow_coneangle = 2.0f * m->light_cutoff[i] * shadowscale;
       AttachLight(L);
       lights.push_back(std::move(L));
     }
@@ -972,6 +1066,68 @@ struct BourbonContext::Impl {
       }
     }
   }
+
+  // Creates the ShadowSource for a light (spot/distant -> DirectionalShadow,
+  // point -> CubeShadow) with its baked projection params and attaches it to the
+  // light's own node, so it inherits the light's placement frame. The shadow
+  // task bakes one encode chain per source at construction, so an add/remove is
+  // structural (see the PassGraphKey check in RenderFrame).
+  void CreateShadowForLight(Light& L) {
+    bourbon::TaskHeap& h = *model_heap;
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::SGContext& sg = *sg_context;
+    switch (L.kind) {
+      case bourbon::SGObjectKind::DistantLight:
+        L.shadow = bourbon::DirectionalShadow::Create(
+            bourbon::DirectionalShadow::DistantParams{
+                .size = L.shadow_size,
+                .width = 2.0f * L.shadow_coverage,
+                .height = 2.0f * L.shadow_coverage,
+                .near = L.shadow_near,
+                .far = L.shadow_far},
+            h, g, sg);
+        break;
+      case bourbon::SGObjectKind::SpotLight:
+        L.shadow = bourbon::DirectionalShadow::Create(
+            bourbon::DirectionalShadow::SpotParams{
+                .size = L.shadow_size,
+                .coneangle = L.shadow_coneangle,
+                .near = L.shadow_near,
+                .far = L.shadow_far},
+            h, g, sg);
+        break;
+      case bourbon::SGObjectKind::PointLight:
+        L.shadow = bourbon::CubeShadow::Create(
+            bourbon::CubeShadow::Params{.size = L.shadow_size,
+                                        .near = L.shadow_near,
+                                        .far = L.shadow_far},
+            h, g, sg);
+        break;
+      default:
+        return;
+    }
+    L.shadow_instance = L.node->addShadowSource(L.shadow, h, g, sg);
+  }
+
+  // Adds/removes shadow sources to match the global shadow enable (mjRND_SHADOW)
+  // for every shadow-casting model light (the headlight never casts). Mutates
+  // the model graph structure (shadow_source_morphology), so it must run before
+  // the model graph is evaluated. Returns true if any shadow source is live.
+  bool UpdateShadows(bool enabled) {
+    bool any = false;
+    for (Light& L : lights) {
+      if (!L.source || L.is_headlight || !L.casts_shadow) continue;
+      if (enabled && !L.shadow_instance) {
+        CreateShadowForLight(L);
+      } else if (!enabled && L.shadow_instance) {
+        L.node->removeSGObject(L.shadow_instance);
+        L.shadow_instance = nullptr;
+        L.shadow.reset();
+      }
+      any = any || (L.shadow_instance != nullptr);
+    }
+    return any;
+  }
 };
 
 BourbonContext::BourbonContext(void* metal_layer)
@@ -1010,6 +1166,7 @@ BourbonContext::BourbonContext(void* metal_layer)
   s.render_graph_evaluator =
       bourbon::TaskGraphEvaluator::Create(*s.render_graph);
   s.render_heap = std::make_unique<bourbon::PersistentHeap>(*s.core);
+  s.pass_heap = std::make_unique<bourbon::PersistentHeap>(*s.core);
 
   s.world = bourbon::World::Create(*s.model_graph, *s.render_graph,
                                    *s.renderer_context);
@@ -1017,6 +1174,7 @@ BourbonContext::BourbonContext(void* metal_layer)
   // Residency sets are registered once for the lifetime of the queue.
   s.queue->addResidencySet(s.model_heap->residencySet());
   s.queue->addResidencySet(s.render_heap->residencySet());
+  s.queue->addResidencySet(s.pass_heap->residencySet());
   s.queue->addResidencySet(s.world->residencySet());
 
   // Camera + projection. Both are live via DGInputs and updated each frame; the
@@ -1046,13 +1204,19 @@ BourbonContext::BourbonContext(void* metal_layer)
 
   s.draw_submission = bourbon::DrawSubmission::Create(
       *s.world, *s.camera, *s.render_graph, *s.renderer_context);
-  s.draw_submission->setMode(bourbon::DrawSubmission::Mode::Direct);
   s.bxdf_pipelines = bourbon::BXDFIntegrationPipelines::Create(
       *s.world, *s.render_graph, *s.renderer_context);
   s.material_pipelines = bourbon::MaterialEvaluationPipelines::Create(
       *s.world, *s.render_graph, *s.renderer_context);
 
-  s.BuildPassGraph();
+  // Render in IndirectDrawsWithCull mode from the start (never Direct). Shadows
+  // require a non-Direct mode (shadowDraws() is null in Direct); the WithCull
+  // variant additionally frustum-culls the main geometry and is view-main's
+  // intended default. (The shadow cull's dependency on IndirectDraws' device
+  // buffer is handled by the priming drain -- see `primed` -- not by the draw
+  // mode.)
+  s.BuildPassGraph(bourbon::DrawSubmission::Mode::IndirectDrawsWithCull);
+  s.pass_heap->allocate();
 
   // A framebuffer for the ImGui overlay: LoadAction=Load preserves the resolved
   // scene already written into the drawable.
@@ -1076,6 +1240,9 @@ void BourbonContext::Init(const mjModel* model) {
   impl_->DrainGpu();
   impl_->ClearScene();
   impl_->BuildScene(model);
+  // A reload re-dirties shape morphology, so IndirectDraws stage 1 runs again on
+  // the next frame; re-prime (one shadowless drain) before re-enabling shadows.
+  impl_->primed = false;
 }
 
 void BourbonContext::SetClearColor(float r, float g, float b, float a) {
@@ -1083,7 +1250,8 @@ void BourbonContext::SetClearColor(float r, float g, float b, float a) {
 }
 
 void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
-                                 mjvCamera* mj_camera, int width, int height) {
+                                 mjvCamera* mj_camera, int width, int height,
+                                 bool shadow_enabled) {
   Impl& s = *impl_;
 
   // Must be first each frame.
@@ -1157,10 +1325,33 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
   // DepthAndBXDFTask. Skip the scene passes for an empty scene and just
   // composite ImGui, so an all-unsupported-geom model does not crash.
   if (s.HasShapes()) {
+    // --- Sync shadow sources to the shadow enable. The submission mode stays
+    // IndirectDrawsWithCull regardless (see the constructor): only the set of
+    // shadow sources changes, which is what gates the pass-graph rebuild below.
+    // Shadows are held off until the scene has been primed by one shadowless
+    // render drain (see `primed`): that drain runs IndirectDraws stage 1, which
+    // produces the persistent device buffer the shadow cull binds. Without this,
+    // the first frame would collide stage 1 with the shadow cull in one sweep
+    // and the cull would read a null buffer.
+    s.UpdateShadows(shadow_enabled && s.primed);
+    const bourbon::DrawSubmission::Mode desired_mode =
+        bourbon::DrawSubmission::Mode::IndirectDrawsWithCull;
+
     // --- Evaluate the model (scene state) graph. ---
     s.model_heap->free();
     s.model_heap->allocate();
     s.model_graph_evaluator->evaluate(*s.model_heap, *s.core);
+
+    // --- Structural pass-graph sync. The shadow-source morphology is computed
+    // by the model graph just evaluated; rebuild the pass graph if the draw mode
+    // or that morphology changed (an add/remove of a shadow source). setMode is
+    // pushed every frame so the submission back-end matches the built graph.
+    const uint64_t morphology = s.world->shadow_source_morphology().value();
+    if (!s.built_valid || s.built_mode != desired_mode ||
+        s.built_shadow_morphology != morphology) {
+      s.RebuildPassGraph(desired_mode, morphology);
+    }
+    s.draw_submission->setMode(desired_mode);
 
     // --- Feed the drawable into the render graph and evaluate it. ---
     {
@@ -1178,6 +1369,11 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
         .context = *s.core,
         .prior_signal = s.prior_render_signal,
     });
+
+    // This drain ran IndirectDraws stage 1 (shapes' morphology was dirty on the
+    // first frame after a build), producing the persistent device buffer. From
+    // the next frame shadows may be enabled without colliding with stage 1.
+    s.primed = true;
   }
 
   // --- Overlay ImGui onto the resolved drawable, then present. ---

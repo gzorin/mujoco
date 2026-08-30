@@ -50,9 +50,11 @@ class BourbonContext {
   // Renders one frame: updates the camera from `camera`, evaluates the bourbon
   // scene/pass graph into the drawable, draws the current ImGui frame on top,
   // then presents. Owns the ImGui::Render() call. The caller must have built the
-  // ImGui frame (ImGui::NewFrame ... widgets) beforehand.
+  // ImGui frame (ImGui::NewFrame ... widgets) beforehand. `shadow_enabled`
+  // (mjRND_SHADOW) toggles shadow casting; enabling it switches the pass graph
+  // onto a non-Direct submission mode.
   void RenderFrame(const mjModel* model, mjData* data, mjvCamera* camera,
-                   int width, int height);
+                   int width, int height, bool shadow_enabled);
 
   // Frames-per-second, exponentially smoothed.
   double GetFps() const;

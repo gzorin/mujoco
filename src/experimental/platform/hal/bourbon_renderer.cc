@@ -42,9 +42,8 @@ void BourbonRenderer::Render(const mjModel* model, mjData* data,
                              const mjvOption* vis_option, int width, int height,
                              std::span<std::byte> pixels,
                              std::span<mjvGeom> extra_geoms) {
-  // Stage 1 will translate the model into the retained scene here. For now the
-  // context renders the (empty) bourbon pass graph and draws ImGui on top.
-  context_->RenderFrame(model, data, camera, width, height);
+  context_->RenderFrame(model, data, camera, width, height,
+                        render_flags_[mjRND_SHADOW] != 0);
 }
 
 void BourbonRenderer::RenderToTexture(const mjModel* model, mjData* data,
