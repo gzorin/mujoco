@@ -15,6 +15,7 @@
 #include "render/bourbon/bourbon_context.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -62,7 +63,10 @@
 #include <BourbonSG/SGContext.h>
 #include <BourbonSG/SGNode.h>
 #include <BourbonSG/ShapeInstance.h>
+#include <BourbonSG/ShapeVar.h>
+#include <BourbonSG/ShapeVarKind.h>
 #include <BourbonSG/Shapes/SDF3D.h>
+#include <BourbonSG/Shapes/TriangleMesh.h>
 
 #include <BourbonCore/Token.h>
 
@@ -184,6 +188,267 @@ uint32_t QuantizeRgba(const float rgba[4]) {
   return (q(rgba[0]) << 24) | (q(rgba[1]) << 16) | (q(rgba[2]) << 8) | q(rgba[3]);
 }
 
+// A de-indexed triangle soup (3 vertices per triangle) staged on the host
+// before upload as a bourbon TriangleMesh. Normals are always supplied;
+// tangents/bitangents are derived at upload; texcoords are optional.
+struct MeshBuild {
+  std::vector<Eigen::Vector3f> positions;
+  std::vector<Eigen::Vector3f> normals;
+  std::vector<Eigen::Vector2f> sts;
+  bool has_st = false;
+};
+
+// Frisvad's branchless orthonormal basis: given a unit normal `n`, produces a
+// tangent `r` and bitangent `u`. Ported from the prior effort's computeTangents.
+void ComputeTangents(const Eigen::Vector3f& n, Eigen::Vector3f& r,
+                     Eigen::Vector3f& u) {
+  const float sign = n.z() < 0.0f ? -1.0f : 1.0f;
+  const float a = -1.0f / (sign + n.z());
+  const float b = n.x() * n.y() * a;
+  r = Eigen::Vector3f(1.0f + sign * n.x() * n.x() * a, sign * b,
+                      -sign * n.x());
+  u = Eigen::Vector3f(b, sign + n.y() * n.y() * a, -n.y());
+}
+
+// Unit face normal of triangle (a,b,c), CCW; falls back to +Z if degenerate.
+Eigen::Vector3f FaceNormal(const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+                           const Eigen::Vector3f& c) {
+  Eigen::Vector3f fn = (b - a).cross(c - a);
+  const float len = fn.norm();
+  return len > 1e-12f ? Eigen::Vector3f(fn / len)
+                      : Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+}
+
+// Appends a flat-shaded triangle (one face normal shared by its 3 vertices).
+void AppendTri(MeshBuild& mb, const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+               const Eigen::Vector3f& c, const Eigen::Vector2f& ua,
+               const Eigen::Vector2f& ub, const Eigen::Vector2f& uc) {
+  const Eigen::Vector3f fn = FaceNormal(a, b, c);
+  mb.positions.push_back(a); mb.normals.push_back(fn); mb.sts.push_back(ua);
+  mb.positions.push_back(b); mb.normals.push_back(fn); mb.sts.push_back(ub);
+  mb.positions.push_back(c); mb.normals.push_back(fn); mb.sts.push_back(uc);
+}
+
+// Appends a flat-shaded quad as two triangles (a,b,d)+(d,b,c), matching the
+// Filament renderer's winding (model_objects.cc append_quad).
+void AppendQuad(MeshBuild& mb, const Eigen::Vector3f& a,
+                const Eigen::Vector3f& b, const Eigen::Vector3f& c,
+                const Eigen::Vector3f& d, const Eigen::Vector2f& ua,
+                const Eigen::Vector2f& ub, const Eigen::Vector2f& uc,
+                const Eigen::Vector2f& ud) {
+  AppendTri(mb, a, b, d, ua, ub, ud);
+  AppendTri(mb, d, b, c, ud, ub, uc);
+}
+
+// De-indexes mesh `meshid` into a triangle soup. MuJoCo carries three
+// independent index streams (mesh_face, mesh_facenormal, mesh_facetexcoord), so
+// a single vertex buffer requires walking faces and emitting unique triples.
+// Applies the hard-normal heuristic (substitute the face normal when the stored
+// vertex normal deviates too far, keeping sharp edges crisp).
+MeshBuild BuildMeshGeometry(const mjModel* m, int meshid) {
+  MeshBuild mb;
+  const int vertadr = m->mesh_vertadr[meshid];
+  const int normaladr = m->mesh_normaladr[meshid];
+  const int texcoordadr = m->mesh_texcoordadr[meshid];
+  const int faceadr = m->mesh_faceadr[meshid];
+  const int facenum = m->mesh_facenum[meshid];
+  mb.has_st = texcoordadr >= 0;
+  const size_t vcount = static_cast<size_t>(facenum) * 3;
+  mb.positions.reserve(vcount);
+  mb.normals.reserve(vcount);
+  if (mb.has_st) mb.sts.reserve(vcount);
+
+  for (int f = faceadr; f < faceadr + facenum; ++f) {
+    const int* face = m->mesh_face + 3 * f;
+    const Eigen::Vector3f p[3] = {
+        Eigen::Vector3f(m->mesh_vert[3 * (face[0] + vertadr) + 0],
+                        m->mesh_vert[3 * (face[0] + vertadr) + 1],
+                        m->mesh_vert[3 * (face[0] + vertadr) + 2]),
+        Eigen::Vector3f(m->mesh_vert[3 * (face[1] + vertadr) + 0],
+                        m->mesh_vert[3 * (face[1] + vertadr) + 1],
+                        m->mesh_vert[3 * (face[1] + vertadr) + 2]),
+        Eigen::Vector3f(m->mesh_vert[3 * (face[2] + vertadr) + 0],
+                        m->mesh_vert[3 * (face[2] + vertadr) + 1],
+                        m->mesh_vert[3 * (face[2] + vertadr) + 2])};
+    const Eigen::Vector3f fn = FaceNormal(p[0], p[1], p[2]);
+    const int* fnorm = m->mesh_facenormal + 3 * f;
+    const int* ftex = mb.has_st ? m->mesh_facetexcoord + 3 * f : nullptr;
+    for (int k = 0; k < 3; ++k) {
+      mb.positions.push_back(p[k]);
+      const float* n = m->mesh_normal + 3 * (fnorm[k] + normaladr);
+      Eigen::Vector3f vn(n[0], n[1], n[2]);
+      if (vn.dot(fn) < 0.8f) vn = fn;  // hard-normal heuristic
+      mb.normals.push_back(vn);
+      if (mb.has_st) {
+        const float* t = m->mesh_texcoord + 2 * (ftex[k] + texcoordadr);
+        mb.sts.emplace_back(t[0], t[1]);
+      }
+    }
+  }
+  return mb;
+}
+
+// Builds a plane geom as a subdivided grid in the geom-local XY plane (+Z
+// normal), with its extent baked into the vertices (so the node transform stays
+// rigid, matching the per-frame update). Infinite dimensions (size == 0) size to
+// the far-plane distance. The grid subdivision is essential: a single quad
+// spanning an "infinite" plane (tens of scene-extents) is one enormous triangle
+// pair, which stresses clip/guard-band and depth interpolation and renders
+// incorrectly (the classic and prior bourbon renderers subdivide for the same
+// reason). Cell size targets the scene extent; texture-repeat UVs land in
+// Stage 3.
+MeshBuild BuildPlaneGeometry(const mjModel* m, int geomid) {
+  MeshBuild mb;
+  mb.has_st = true;
+  const mjtNum* size = m->geom_size + 3 * geomid;
+  const float far = static_cast<float>(m->vis.map.zfar * m->stat.extent);
+  const float hx = size[0] > 0 ? static_cast<float>(size[0]) : far;
+  const float hy = size[1] > 0 ? static_cast<float>(size[1]) : far;
+  const float cell = std::max(static_cast<float>(m->stat.extent), 1e-3f);
+  auto subdiv = [&](float half) {
+    int n = static_cast<int>(std::ceil(2.0f * half / cell));
+    if (n < m->vis.quality.numquads) n = m->vis.quality.numquads;
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;
+    return n;
+  };
+  const int nx = subdiv(hx), ny = subdiv(hy);
+  for (int ix = 0; ix < nx; ++ix) {
+    const float x0 = -hx + 2.0f * hx * ix / nx;
+    const float x1 = -hx + 2.0f * hx * (ix + 1) / nx;
+    const float u0 = static_cast<float>(ix) / nx;
+    const float u1 = static_cast<float>(ix + 1) / nx;
+    for (int iy = 0; iy < ny; ++iy) {
+      const float y0 = -hy + 2.0f * hy * iy / ny;
+      const float y1 = -hy + 2.0f * hy * (iy + 1) / ny;
+      const float v0 = static_cast<float>(iy) / ny;
+      const float v1 = static_cast<float>(iy + 1) / ny;
+      AppendQuad(mb, Eigen::Vector3f(x0, y0, 0.0f),
+                 Eigen::Vector3f(x1, y0, 0.0f), Eigen::Vector3f(x1, y1, 0.0f),
+                 Eigen::Vector3f(x0, y1, 0.0f), Eigen::Vector2f(u0, v0),
+                 Eigen::Vector2f(u1, v0), Eigen::Vector2f(u1, v1),
+                 Eigen::Vector2f(u0, v1));
+    }
+  }
+  return mb;
+}
+
+// Tessellates height field `hid` into a closed box: a top surface (4 triangles
+// per grid cell around a centre vertex, avoiding spurious bumps), four skirts
+// down to the base, and a base plane. Flat per-triangle normals. Ported from
+// the Filament renderer (model_objects.cc FillHeightFieldBuffer).
+MeshBuild BuildHfieldGeometry(const mjModel* m, int hid) {
+  MeshBuild mb;
+  mb.has_st = true;
+  const float* data = m->hfield_data + m->hfield_adr[hid];
+  const int nrow = m->hfield_nrow[hid];
+  const int ncol = m->hfield_ncol[hid];
+  const float fheight = 0.5f * (nrow - 1);
+  const float fwidth = 0.5f * (ncol - 1);
+  float sz[4];
+  for (int i = 0; i < 4; ++i) {
+    sz[i] = static_cast<float>(m->hfield_size[4 * hid + i]);
+  }
+  auto pos = [&](int r, int c) {
+    return Eigen::Vector3f(sz[0] * (c / fwidth - 1.0f),
+                           sz[1] * (r / fheight - 1.0f),
+                           sz[2] * data[r * ncol + c]);
+  };
+  auto uv = [&](int r, int c) {
+    return Eigen::Vector2f(static_cast<float>(c) / (ncol - 1),
+                           1.0f - static_cast<float>(r) / (nrow - 1));
+  };
+
+  // Top surface.
+  for (int row = 0; row < nrow - 1; ++row) {
+    for (int col = 0; col < ncol - 1; ++col) {
+      const Eigen::Vector3f a = pos(row, col), b = pos(row, col + 1),
+                            c = pos(row + 1, col + 1), d = pos(row + 1, col);
+      float mid_z;
+      if (a.z() == c.z() && b.z() != d.z()) {
+        mid_z = a.z();
+      } else if (a.z() != c.z() && b.z() == d.z()) {
+        mid_z = b.z();
+      } else {
+        mid_z = std::max((a.z() + c.z()) * 0.5f, (b.z() + d.z()) * 0.5f);
+      }
+      const Eigen::Vector3f mid((a.x() + b.x()) * 0.5f, (a.y() + d.y()) * 0.5f,
+                                mid_z);
+      const Eigen::Vector2f ua = uv(row, col), ub = uv(row, col + 1),
+                            uc = uv(row + 1, col + 1), ud = uv(row + 1, col);
+      const Eigen::Vector2f umid(
+          static_cast<float>(col + 0.5f) / (ncol - 1),
+          1.0f - static_cast<float>(row + 0.5f) / (nrow - 1));
+      AppendTri(mb, a, b, mid, ua, ub, umid);
+      AppendTri(mb, b, c, mid, ub, uc, umid);
+      AppendTri(mb, c, d, mid, uc, ud, umid);
+      AppendTri(mb, d, a, mid, ud, ua, umid);
+    }
+  }
+  // Left / right skirts.
+  for (int row = 0; row < nrow - 1; ++row) {
+    const Eigen::Vector3f a = pos(row, 0), b = pos(row + 1, 0);
+    AppendQuad(mb, a, b, Eigen::Vector3f(b.x(), b.y(), -sz[3]),
+               Eigen::Vector3f(a.x(), a.y(), -sz[3]),
+               Eigen::Vector2f(0.0f, 1.0f - static_cast<float>(row) / (nrow - 1)),
+               Eigen::Vector2f(0.0f, 1.0f - static_cast<float>(row + 1) / (nrow - 1)),
+               Eigen::Vector2f(0.0f, 1.0f - static_cast<float>(row + 1) / (nrow - 1)),
+               Eigen::Vector2f(0.0f, 1.0f - static_cast<float>(row) / (nrow - 1)));
+  }
+  for (int row = 0; row < nrow - 1; ++row) {
+    const Eigen::Vector3f a = pos(row + 1, ncol - 1), b = pos(row, ncol - 1);
+    AppendQuad(mb, a, b, Eigen::Vector3f(b.x(), b.y(), -sz[3]),
+               Eigen::Vector3f(a.x(), a.y(), -sz[3]),
+               Eigen::Vector2f(1.0f, 1.0f - static_cast<float>(row + 1) / (nrow - 1)),
+               Eigen::Vector2f(1.0f, 1.0f - static_cast<float>(row) / (nrow - 1)),
+               Eigen::Vector2f(1.0f, 1.0f - static_cast<float>(row) / (nrow - 1)),
+               Eigen::Vector2f(1.0f, 1.0f - static_cast<float>(row + 1) / (nrow - 1)));
+  }
+  // Front / back skirts.
+  for (int col = 0; col < ncol - 1; ++col) {
+    const Eigen::Vector3f a = pos(0, col), dd = pos(0, col + 1);
+    AppendQuad(mb, a, Eigen::Vector3f(a.x(), a.y(), -sz[3]),
+               Eigen::Vector3f(dd.x(), dd.y(), -sz[3]), dd,
+               Eigen::Vector2f(static_cast<float>(col) / (ncol - 1), 1.0f),
+               Eigen::Vector2f(static_cast<float>(col) / (ncol - 1), 1.0f),
+               Eigen::Vector2f(static_cast<float>(col + 1) / (ncol - 1), 1.0f),
+               Eigen::Vector2f(static_cast<float>(col + 1) / (ncol - 1), 1.0f));
+  }
+  for (int col = 0; col < ncol - 1; ++col) {
+    const Eigen::Vector3f a = pos(nrow - 1, col + 1), dd = pos(nrow - 1, col);
+    AppendQuad(mb, a, Eigen::Vector3f(a.x(), a.y(), -sz[3]),
+               Eigen::Vector3f(dd.x(), dd.y(), -sz[3]), dd,
+               Eigen::Vector2f(static_cast<float>(col + 1) / (ncol - 1), 0.0f),
+               Eigen::Vector2f(static_cast<float>(col + 1) / (ncol - 1), 0.0f),
+               Eigen::Vector2f(static_cast<float>(col) / (ncol - 1), 0.0f),
+               Eigen::Vector2f(static_cast<float>(col) / (ncol - 1), 0.0f));
+  }
+  // Base (sized by visualization quality, not the grid resolution).
+  const float bw = 0.5f * m->vis.quality.numquads;
+  const float bh = 0.5f * m->vis.quality.numquads;
+  for (int row = 0; row < m->vis.quality.numquads; ++row) {
+    for (int col = 0; col < m->vis.quality.numquads; ++col) {
+      const float x0 = sz[0] * ((col + 0) / bw - 1.0f);
+      const float x1 = sz[0] * ((col + 1) / bw - 1.0f);
+      const float y0 = sz[1] * ((row + 0) / bh - 1.0f);
+      const float y1 = sz[1] * ((row + 1) / bh - 1.0f);
+      const Eigen::Vector2f uv0((col + 0) / (2.0f * bw),
+                                1.0f - (row + 0) / (2.0f * bh));
+      const Eigen::Vector2f uv1((col + 1) / (2.0f * bw),
+                                1.0f - (row + 1) / (2.0f * bh));
+      AppendQuad(mb, Eigen::Vector3f(x0, y0, -sz[3]),
+                 Eigen::Vector3f(x0, y1, -sz[3]),
+                 Eigen::Vector3f(x1, y1, -sz[3]),
+                 Eigen::Vector3f(x1, y0, -sz[3]),
+                 Eigen::Vector2f(uv0.x(), uv0.y()),
+                 Eigen::Vector2f(uv0.x(), uv1.y()),
+                 Eigen::Vector2f(uv1.x(), uv1.y()),
+                 Eigen::Vector2f(uv1.x(), uv0.y()));
+    }
+  }
+  return mb;
+}
+
 }  // namespace
 
 struct BourbonContext::Impl {
@@ -240,6 +505,9 @@ struct BourbonContext::Impl {
   const bourbon::BXDFClass* pbr_bxdf = nullptr;
   const bourbon::PatternClass* pbr_pattern = nullptr;
   std::map<uint32_t, bourbon::RefPtr<bourbon::Material>> material_cache;
+  // TriangleMesh shape caches, so geoms sharing a mesh/hfield share one Shape.
+  std::map<int, bourbon::RefPtr<bourbon::Shape>> mesh_shape_cache;
+  std::map<int, bourbon::RefPtr<bourbon::Shape>> hfield_shape_cache;
   std::vector<bourbon::SGNode*> light_nodes;
   std::vector<bourbon::RefPtr<bourbon::DistantLight>> lights;
 
@@ -289,11 +557,38 @@ struct BourbonContext::Impl {
         integrator->output(), *camera, *render_graph, *renderer_context);
   }
 
-  // Maps a MuJoCo geom to a bourbon SDF primitive, with sizes baked in from
-  // mjModel::geom_size (index 1 is the half-length for capsule/cylinder). Ray-
-  // marched SDFs require rigid node transforms, so all sizing lives here, never
-  // in the node scale. Returns null for geom types not yet supported (plane,
-  // mesh, hfield, ...).
+  // Uploads a host triangle soup as a bourbon TriangleMesh Shape, deriving
+  // tangents/bitangents per vertex. Returns null for an empty build.
+  bourbon::RefPtr<bourbon::Shape> CreateTriangleMeshShape(const MeshBuild& mb) {
+    const size_t vcount = mb.positions.size();
+    if (vcount < 3) return {};
+    std::vector<Eigen::Vector3f> tangents(vcount), bitangents(vcount);
+    for (size_t i = 0; i < vcount; ++i) {
+      ComputeTangents(mb.normals[i], tangents[i], bitangents[i]);
+    }
+    bourbon::TriangleMesh::Params params;
+    params.count = static_cast<unsigned>(vcount / 3);
+    params.positions = bourbon::MakeShapeVarSource(mb.positions.data());
+    params.normals =
+        bourbon::MakeShapeVar(bourbon::ShapeVarKind::Vertex, mb.normals.data());
+    params.dPdU =
+        bourbon::MakeShapeVar(bourbon::ShapeVarKind::Vertex, tangents.data());
+    params.dPdV =
+        bourbon::MakeShapeVar(bourbon::ShapeVarKind::Vertex, bitangents.data());
+    if (mb.has_st && !mb.sts.empty()) {
+      params.st =
+          bourbon::MakeShapeVar(bourbon::ShapeVarKind::Vertex, mb.sts.data());
+    }
+    return bourbon::TriangleMesh::Create(params, *model_heap, *model_graph,
+                                         *sg_context);
+  }
+
+  // Maps a MuJoCo geom to a bourbon Shape. Primitives become ray-marched SDFs
+  // with sizes baked in from mjModel::geom_size (index 1 is the half-length for
+  // capsule/cylinder; SDFs require rigid node transforms, so all sizing lives
+  // here, never in the node scale). Planes, meshes, and height fields become
+  // rasterized TriangleMeshes; mesh/hfield shapes are cached so instances share
+  // one Shape. Returns null for geom types not yet supported.
   bourbon::RefPtr<bourbon::Shape> MakeShapeForGeom(const mjModel* m, int i) {
     const mjtNum* size = m->geom_size + 3 * i;
     const float a = static_cast<float>(size[0]);
@@ -324,8 +619,28 @@ struct BourbonContext::Impl {
             bourbon::SDF3D::EllipsoidParams{
                 .radius_x = a, .radius_y = b, .radius_z = c},
             h, g, sg);
+      case mjGEOM_PLANE:
+        return CreateTriangleMeshShape(BuildPlaneGeometry(m, i));
+      case mjGEOM_MESH: {
+        const int meshid = m->geom_dataid[i];
+        if (meshid < 0) return {};
+        auto it = mesh_shape_cache.find(meshid);
+        if (it != mesh_shape_cache.end()) return it->second;
+        auto shape = CreateTriangleMeshShape(BuildMeshGeometry(m, meshid));
+        mesh_shape_cache[meshid] = shape;
+        return shape;
+      }
+      case mjGEOM_HFIELD: {
+        const int hid = m->geom_dataid[i];
+        if (hid < 0) return {};
+        auto it = hfield_shape_cache.find(hid);
+        if (it != hfield_shape_cache.end()) return it->second;
+        auto shape = CreateTriangleMeshShape(BuildHfieldGeometry(m, hid));
+        hfield_shape_cache[hid] = shape;
+        return shape;
+      }
       default:
-        return {};  // plane, mesh, hfield, etc.: later stages.
+        return {};  // SDF plugin geoms, etc.: later stages.
     }
   }
 
@@ -336,6 +651,8 @@ struct BourbonContext::Impl {
     }
     geoms.clear();
     material_cache.clear();
+    mesh_shape_cache.clear();
+    hfield_shape_cache.clear();
     pbr_bxdf = nullptr;
     pbr_pattern = nullptr;
     light_nodes.clear();
@@ -400,10 +717,25 @@ struct BourbonContext::Impl {
     BuildLight();
   }
 
-  // Adds one distant light travelling in world direction `dir` at `lux`
-  // illuminance. Direction only (from is the origin; DistantLight is placement-
-  // independent), so an identity node transform suffices.
-  void AddDistantLight(const Eigen::Vector3f& dir, float lux) {
+  // Whether any geom produced a renderable node. Bourbon's forward pass graph
+  // dereferences a null (zero-count) shape-index buffer and asserts if the world
+  // has no shapes, so callers must not evaluate the render graph in that case.
+  bool HasShapes() const {
+    for (const auto& r : geoms) {
+      if (r.node) return true;
+    }
+    return false;
+  }
+
+  // Adds one distant light whose illumination arrives from world direction
+  // `toward_light` (the vector from a surface toward the light) at `lux`
+  // illuminance. Bourbon's DistantLight stores `direction = normalize(from - to)`
+  // and lights surfaces from the `to` side, so the toward-light vector is
+  // `to - from`; with `from` at the origin, `to = toward_light`. (The from/to
+  // naming is counterintuitive -- it is NOT the propagation direction.)
+  // DistantLight is placement-independent, so an identity node transform
+  // suffices.
+  void AddDistantLight(const Eigen::Vector3f& toward_light, float lux) {
     bourbon::TaskHeap& h = *model_heap;
     bourbon::TaskGraph& g = *model_graph;
     bourbon::SGContext& sg = *sg_context;
@@ -413,8 +745,9 @@ struct BourbonContext::Impl {
     p.intensity = {lux, bourbon::LightSource::Intensity::Unit::Lux};
     // Colour defaults to unit-luminance white RGB.
     p.from = bourbon::Point<bourbon::Space::Object>{0.0f, 0.0f, 0.0f, 1.0f};
-    p.to = bourbon::Point<bourbon::Space::Object>{dir.x(), dir.y(), dir.z(),
-                                                  1.0f};
+    p.to = bourbon::Point<bourbon::Space::Object>{toward_light.x(),
+                                                  toward_light.y(),
+                                                  toward_light.z(), 1.0f};
     auto light = bourbon::DistantLight::Create(p, h, g, sg);
 
     bourbon::SGNode* node = scene.createNode();
@@ -431,12 +764,14 @@ struct BourbonContext::Impl {
   // and image-based lighting). MuJoCo is z-up; the key rakes down across a
   // standing model and the dimmer fill lifts the opposite side.
   void BuildLight() {
-    // Key: clear-noon-sun illuminance, paired with the camera's sunny-16
-    // photometric exposure (see the Camera setup) so the scene lands in range.
-    AddDistantLight(Eigen::Vector3f(0.3f, 0.5f, -1.0f), 100000.0f);
+    // Directions are toward-light vectors (see AddDistantLight). Key: a high,
+    // slightly-off-axis sun (mostly +z, MuJoCo is z-up) at clear-noon-sun
+    // illuminance, paired with the camera's sunny-16 photometric exposure so the
+    // scene lands in range.
+    AddDistantLight(Eigen::Vector3f(-0.3f, -0.5f, 1.0f), 100000.0f);
     // Fill from the opposite side and less steep, at ~1/5 the key, to soften
     // the shadow side without flattening the form.
-    AddDistantLight(Eigen::Vector3f(-0.5f, -0.4f, -0.6f), 20000.0f);
+    AddDistantLight(Eigen::Vector3f(0.5f, 0.4f, 0.6f), 20000.0f);
   }
 };
 
@@ -614,27 +949,34 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     }
   }
 
-  // --- Evaluate the model (scene state) graph. ---
-  s.model_heap->free();
-  s.model_heap->allocate();
-  s.model_graph_evaluator->evaluate(*s.model_heap, *s.core);
+  // Bourbon's forward pass graph dereferences the world's shape-index buffer
+  // unconditionally, and that buffer is a null (unallocated) DevicePtr when the
+  // scene has zero shapes -- evaluating the render graph then asserts inside
+  // DepthAndBXDFTask. Skip the scene passes for an empty scene and just
+  // composite ImGui, so an all-unsupported-geom model does not crash.
+  if (s.HasShapes()) {
+    // --- Evaluate the model (scene state) graph. ---
+    s.model_heap->free();
+    s.model_heap->allocate();
+    s.model_graph_evaluator->evaluate(*s.model_heap, *s.core);
 
-  // --- Feed the drawable into the render graph and evaluate it. ---
-  {
-    bourbon::Promise<bourbon::DeviceImage<2>> promise;
-    promise.set_value(drawable->image());
-    s.drawable_source->set(promise.get_future().share());
+    // --- Feed the drawable into the render graph and evaluate it. ---
+    {
+      bourbon::Promise<bourbon::DeviceImage<2>> promise;
+      promise.set_value(drawable->image());
+      s.drawable_source->set(promise.get_future().share());
+    }
+    s.clear_task->extent_in().setValue(extent);
+    s.integrator->setExtent(extent);
+
+    s.render_heap->free();
+    s.render_heap->allocate();
+    s.prior_render_signal = s.render_graph_evaluator->evaluate({
+        .task_heap = *s.render_heap,
+        .context = *s.core,
+        .prior_signal = s.prior_render_signal,
+    });
   }
-  s.clear_task->extent_in().setValue(extent);
-  s.integrator->setExtent(extent);
-
-  s.render_heap->free();
-  s.render_heap->allocate();
-  s.prior_render_signal = s.render_graph_evaluator->evaluate({
-      .task_heap = *s.render_heap,
-      .context = *s.core,
-      .prior_signal = s.prior_render_signal,
-  });
 
   // --- Overlay ImGui onto the resolved drawable, then present. ---
   auto encoder =
