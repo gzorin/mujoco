@@ -53,9 +53,15 @@ int LaunchStudio(int argc, char** argv, LauncherConfig config) {
     }
   }
 
+#if defined(MUJOCO_USE_FILAMENT)
+  const mujoco::platform::GraphicsMode default_mode =
+      mujoco::platform::GraphicsMode::FilamentOpenGl;
+#else
+  const mujoco::platform::GraphicsMode default_mode =
+      mujoco::platform::GraphicsMode::ClassicOpenGl;
+#endif
   mujoco::platform::GraphicsMode gfx_mode =
-      mujoco::platform::GraphicsModeFromString(
-          config.gfx_mode, mujoco::platform::GraphicsMode::FilamentOpenGl);
+      mujoco::platform::GraphicsModeFromString(config.gfx_mode, default_mode);
 
   // Use config values if they are set (non-default), otherwise use flags.
   mujoco::studio::App app({

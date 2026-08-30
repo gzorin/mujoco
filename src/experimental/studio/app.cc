@@ -38,7 +38,9 @@
 #include <implot.h>
 #include <mujoco/mujoco.h>
 #include "experimental/platform/hal/classic_renderer.h"
+#if defined(MUJOCO_USE_FILAMENT)
 #include "experimental/platform/hal/filament_renderer.h"
+#endif
 #include "experimental/platform/hal/graphics_mode.h"
 #include "experimental/platform/hal/renderer.h"
 #include "experimental/platform/hal/window.h"
@@ -131,10 +133,16 @@ void App::SwitchGraphicsMode(int width, int height,
   if (platform::IsClassic(gfx_mode_)) {
     renderer_ = std::make_unique<platform::ClassicRenderer>(
         window_->GetNativeWindowHandle(), gfx_mode_);
-
-  } else {
+#if defined(MUJOCO_USE_FILAMENT)
+  } else if (platform::IsFilament(gfx_mode_)) {
     renderer_ = std::make_unique<platform::FilamentRenderer>(
         window_->GetNativeWindowHandle(), gfx_mode_);
+#endif
+  } else {
+    mju_error(
+        "No renderer is available for the requested graphics mode. This build "
+        "was compiled without the Filament renderer (MUJOCO_USE_FILAMENT=OFF); "
+        "use --graphics=classic or rebuild with a supported renderer.");
   }
 
   // TODO: Figure out why this breaks on some platforms.

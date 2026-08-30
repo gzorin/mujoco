@@ -30,8 +30,6 @@ target_sources(${MUJOCO_PLATFORM_TARGET_NAME}
         hal/classic_renderer.h
         hal/egl_utils.cc
         hal/egl_utils.h
-        hal/filament_renderer.cc
-        hal/filament_renderer.h
         hal/graphics_mode.cc
         hal/graphics_mode.h
         hal/renderer.h
@@ -73,6 +71,20 @@ if(NOT WIN32)
   )
 endif()
 
+# The Filament renderer is only compiled when Filament is enabled; root
+# CMakeLists.txt only defines the mujoco::filament target under
+# MUJOCO_USE_FILAMENT. The MUJOCO_USE_FILAMENT compile definition is propagated
+# PUBLIC so consumers (studio's app.cc) can guard their own Filament references.
+if(MUJOCO_USE_FILAMENT)
+    target_sources(${MUJOCO_PLATFORM_TARGET_NAME}
+        PRIVATE
+            hal/filament_renderer.cc
+            hal/filament_renderer.h
+    )
+    target_compile_definitions(${MUJOCO_PLATFORM_TARGET_NAME}
+        PUBLIC MUJOCO_USE_FILAMENT)
+endif()
+
 if(APPLE)
     set_source_files_properties(hal/window_osx.mm PROPERTIES
         COMPILE_FLAGS "-x objective-c++")
@@ -112,10 +124,13 @@ target_link_libraries(${MUJOCO_PLATFORM_TARGET_NAME}
     dear_imgui_OpenGL3
     dear_imgui_stdlib
     implot
-    mujoco::filament
     webp
     SDL2::SDL2-static
     ${MUJOCO_PLATFORM_RENDER_DEPS}
 )
+
+if(MUJOCO_USE_FILAMENT)
+    target_link_libraries(${MUJOCO_PLATFORM_TARGET_NAME} mujoco::filament)
+endif()
 
 add_library(mujoco::platform ALIAS ${MUJOCO_PLATFORM_TARGET_NAME})
