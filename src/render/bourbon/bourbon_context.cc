@@ -14,8 +14,10 @@
 
 #include "render/bourbon/bourbon_context.h"
 
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -55,6 +57,7 @@
 #include <BourbonSG/Camera.h>
 #include <BourbonSG/LightSource.h>
 #include <BourbonSG/LightSources/DistantLight.h>
+#include <BourbonSG/LightSources/EnvironmentLight.h>
 #include <BourbonSG/LightSources/PointLight.h>
 #include <BourbonSG/LightSources/SpotLight.h>
 #include <BourbonSG/Material.h>
@@ -75,6 +78,7 @@
 #include <BourbonSG/ShapeVarKind.h>
 #include <BourbonSG/Shapes/SDF3D.h>
 #include <BourbonSG/Shapes/TriangleMesh.h>
+#include <BourbonSG/TextureMaps/TextureMap2D.h>
 
 #include <BourbonCore/Token.h>
 
@@ -164,6 +168,10 @@ struct Light {
   bourbon::LightSource::Intensity::Unit intensity_unit =
       bourbon::LightSource::Intensity::Unit::Lux;
   bool is_headlight = false;
+  // An image-based (environment) light. Its placement frame and its radiance
+  // are both baked at build time, so it is skipped by the per-frame update and
+  // is not index-aligned with mjModel's lights (it is appended last).
+  bool is_environment = false;
 
   // Shadow state. A shadow source is attached to this same node (so it inherits
   // the light's placement frame) on demand and removed when shadows are turned
@@ -196,6 +204,160 @@ constexpr float kClassicDirectionalLux = 100000.0f;
 // the directional target so two overlapping spots plus the headlight stay in
 // range under the sunny-16 exposure.
 constexpr float kClassicPunctualCandela = 25000.0f;
+
+constexpr float kPi = 3.14159265358979323846f;
+
+// --- Image-based (environment) lighting -------------------------------------
+//
+// Bourbon has no visible-background pass, so the environment light is purely
+// the indirect/ambient term: it is what stops the unlit sides of a model from
+// going black under a PBR integrator, and it is the closest analogue MuJoCo's
+// ambient terms have here.
+//
+// The source is always a lat-long (equirectangular) image, even for a MuJoCo
+// skybox cube: resampling the cube on the host is a few lines and keeps a
+// single code path whose orientation we control exactly, whereas the
+// CubeEnvironmentLight shader path negates its sample direction and bypasses
+// the BXDF's own indirect evaluation.
+//
+// Sizes are powers of two: LatLongEnvironmentLight derives its radiance mip
+// count as log2(height). The source is deliberately small — it is only ever
+// read to bake the irradiance/radiance maps, never sampled for display.
+constexpr unsigned kEnvSourceHeight = 128;      // source is 2H x H
+constexpr unsigned kEnvIrradianceHeight = 64;
+constexpr unsigned kEnvRadianceHeight = 128;
+constexpr std::array<unsigned, 2> kEnvIrradianceSampleCount = {128, 32};
+
+// Ambient irradiance a fully white (1,1,1) skybox delivers, as a fraction of
+// the scene's reference illuminance (see ReferenceIlluminance). A skybox image
+// carries no photometric units, so this is the calibration that puts it in
+// range under the camera's sunny-16 exposure. When there is no skybox the
+// fraction is MuJoCo's own ambient instead, which needs no fudge factor: the
+// classic renderer adds `ambient * albedo` next to `diffuse * NdotL * albedo`,
+// so an environment delivering `ambient * reference` lux reproduces exactly
+// that ratio.
+constexpr float kSkyboxIrradianceFraction = 0.15f;
+
+// Radiance of the lower hemisphere relative to the upper one in the
+// synthesized gradient. Below 1 so the fill keeps an up/down cue rather than
+// flattening the model the way a uniform ambient does.
+constexpr float kEnvGroundFraction = 0.3f;
+
+// sRGB electro-optical transfer function (decode to linear).
+float SrgbToLinear(float c) {
+  return c <= 0.04045f ? c / 12.92f
+                       : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+int ClampInt(int v, int lo, int hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Reads texel `texel` (a flat index into texture `texid`'s data) as linear RGB
+// in [0,1], decoding sRGB when the texture declares it. Single-channel data is
+// broadcast to grey; the alpha channel of RGBA data is ignored (an environment
+// has no transparency).
+Eigen::Array3f TexelLinear(const mjModel* m, int texid, size_t texel) {
+  const int nchannel = m->tex_nchannel[texid];
+  const mjtByte* p = m->tex_data + m->tex_adr[texid] + texel * nchannel;
+  const bool srgb = m->tex_colorspace[texid] == mjCOLORSPACE_SRGB;
+  Eigen::Array3f c;
+  for (int k = 0; k < 3; ++k) {
+    const float v = (nchannel > k ? p[k] : p[0]) / 255.0f;
+    c[k] = srgb ? SrgbToLinear(v) : v;
+  }
+  return c;
+}
+
+// Point-samples a MuJoCo cube/skybox texture along `d`, in the OpenGL/Metal
+// cube-map convention (identical in both). Faces are w*w and stacked in GL
+// face order (+X,-X,+Y,-Y,+Z,-Z); a square texture (height == width) is a
+// single face repeated on all six (render_context.c:1525).
+//
+// A MuJoCo skybox cube is authored Y-UP, not z-up: the classic renderer binds
+// it with object-linear texgen s=x, t=z, r=-y -- "rotate 90 deg around X"
+// (render_gl3.c:233-241) -- and the builtin cube generator agrees, filling
+// face 2 (+Y) with "up" and face 3 (-Y) with "down" (user_objects.cc:4925).
+// That rotation is exactly the environment light's own frame, so `d` here is
+// the direction in the light's OBJECT space, not in world space.
+Eigen::Array3f SampleCubeTexture(const mjModel* m, int texid,
+                                 const Eigen::Vector3f& d) {
+  const int w = m->tex_width[texid];
+  const int h = m->tex_height[texid];
+  const float ax = std::fabs(d.x()), ay = std::fabs(d.y()), az = std::fabs(d.z());
+  int face;
+  float sc, tc, ma;
+  if (ax >= ay && ax >= az) {
+    ma = ax;
+    if (d.x() > 0) { face = 0; sc = -d.z(); } else { face = 1; sc = d.z(); }
+    tc = -d.y();
+  } else if (ay >= az) {
+    ma = ay;
+    if (d.y() > 0) { face = 2; tc = d.z(); } else { face = 3; tc = -d.z(); }
+    sc = d.x();
+  } else {
+    ma = az;
+    if (d.z() > 0) { face = 4; sc = d.x(); } else { face = 5; sc = -d.x(); }
+    tc = -d.y();
+  }
+  if (ma < 1e-9f) ma = 1e-9f;
+  const int col = ClampInt(static_cast<int>(0.5f * (sc / ma + 1.0f) * w), 0, w - 1);
+  const int row = ClampInt(static_cast<int>(0.5f * (tc / ma + 1.0f) * w), 0, w - 1);
+  const size_t face_offset =
+      (h == w) ? 0 : static_cast<size_t>(face) * w * w;
+  return TexelLinear(m, texid, face_offset + static_cast<size_t>(row) * w + col);
+}
+
+// Point-samples a MuJoCo 2D texture as an equirectangular environment along
+// world direction `d`: longitude runs counter-clockwise from +x about the
+// world z axis, and row 0 is the zenith. MuJoCo does not pin a convention for
+// mjLIGHT_IMAGE textures, so this is ours.
+Eigen::Array3f SampleLatLongTexture(const mjModel* m, int texid,
+                                    const Eigen::Vector3f& d) {
+  const int w = m->tex_width[texid];
+  const int h = m->tex_height[texid];
+  const float u = std::atan2(d.y(), d.x()) / (2.0f * kPi) + 0.5f;
+  const float z = d.z() < -1.0f ? -1.0f : (d.z() > 1.0f ? 1.0f : d.z());
+  const float v = std::acos(z) / kPi;
+  const int col = ClampInt(static_cast<int>(u * w), 0, w - 1);
+  const int row = ClampInt(static_cast<int>(v * h), 0, h - 1);
+  return TexelLinear(m, texid, static_cast<size_t>(row) * w + col);
+}
+
+// Inverse of MaterialX's mx_latlong_projection (mx_microfacet_specular.glsl),
+// which is the mapping the baked environment maps are ultimately sampled with:
+// v = -asin(y)/pi + 0.5, u = atan2(x, -z)/2pi + 0.5. Returns the direction in
+// the environment light's OBJECT space, which is y-up.
+Eigen::Vector3f LatLongDirection(float u, float v) {
+  const float y = std::sin(kPi * (0.5f - v));
+  const float r2 = 1.0f - y * y;
+  const float r = std::sqrt(r2 > 0.0f ? r2 : 0.0f);
+  const float theta = 2.0f * kPi * (u - 0.5f);
+  return Eigen::Vector3f(r * std::sin(theta), y, -r * std::cos(theta));
+}
+
+// Object->world transform for the environment light's node. The shader samples
+// the environment with the direction taken into the node's object space, and
+// MaterialX's lat-long projection is y-up, so this maps object +y onto MuJoCo's
+// world +z: a rotation of +90 degrees about x (y->z, z->-y).
+Eigen::Affine3f EnvironmentFrame() {
+  return Eigen::Affine3f(
+      Eigen::AngleAxisf(0.5f * kPi, Eigen::Vector3f::UnitX()));
+}
+
+// The illuminance the scene's brightest light delivers, used to put the
+// environment's radiance on the same photometric scale as the punctual lights
+// (whose classic-scene magnitudes are themselves calibrated against the
+// camera's sunny-16 exposure).
+float ReferenceIlluminance(const mjModel* m) {
+  float best = 0.0f;
+  for (int i = 0; i < m->nlight; ++i) {
+    if (m->light_type[i] == mjLIGHT_DIRECTIONAL) {
+      best = std::max(best, m->light_intensity[i]);
+    }
+  }
+  return best > 0.0f ? best : kClassicDirectionalLux;
+}
 
 // Builds a rigid object->world transform from a MuJoCo position (3) and a
 // row-major 3x3 orientation (mjData::geom_xmat is row-major). Eigen's comma
@@ -623,9 +785,13 @@ struct BourbonContext::Impl {
   // TriangleMesh shape caches, so geoms sharing a mesh/hfield share one Shape.
   std::map<int, bourbon::RefPtr<bourbon::Shape>> mesh_shape_cache;
   std::map<int, bourbon::RefPtr<bourbon::Shape>> hfield_shape_cache;
-  // Retained lights: one per mjModel light (image lights leave a null-source
-  // slot for now; IBL lands in a later increment) followed by the headlight.
+  // Retained lights: one per mjModel light (an mjLIGHT_IMAGE slot is left
+  // source-less -- its texture drives the environment light instead), then the
+  // headlight, then at most one environment light. Only the first nlight
+  // entries are index-aligned with mjModel.
   std::vector<Light> lights;
+  // Source image of the environment light, held so it outlives the bake.
+  bourbon::RefPtr<bourbon::TextureMap2D> env_source_image;
 
   std::chrono::steady_clock::time_point last_frame;
   bool have_last_frame = false;
@@ -800,6 +966,7 @@ struct BourbonContext::Impl {
     pbr_bxdf = nullptr;
     pbr_pattern = nullptr;
     lights.clear();
+    env_source_image.reset();
   }
 
   // Returns a flat glTF-PBR material for `rgba`, creating and caching one per
@@ -950,7 +1117,8 @@ struct BourbonContext::Impl {
 
     using Unit = bourbon::LightSource::Intensity::Unit;
     lights.clear();
-    lights.reserve(m->nlight + 1);
+    lights.reserve(m->nlight + 2);
+    int image_light = -1;  // first mjLIGHT_IMAGE, drives the environment light
     for (int i = 0; i < m->nlight; ++i) {
       Light L;
       bourbon::LightSource::Colour color;
@@ -1005,7 +1173,13 @@ struct BourbonContext::Impl {
               h, g, sg);
           break;
         default:
-          // mjLIGHT_IMAGE (and any future kinds): no source yet; keep the slot.
+          // mjLIGHT_IMAGE (and any future kinds) has no punctual source: keep
+          // the slot so the first nlight entries stay index-aligned with
+          // mjModel, and let the first image light's texture drive the single
+          // environment light built below.
+          if (m->light_type[i] == mjLIGHT_IMAGE && image_light < 0) {
+            image_light = i;
+          }
           lights.push_back(std::move(L));
           continue;
       }
@@ -1033,6 +1207,138 @@ struct BourbonContext::Impl {
       AttachLight(L);
       lights.push_back(std::move(L));
     }
+
+    BuildEnvironment(m, image_light);
+  }
+
+  // Builds the single image-based (environment) light: the indirect/ambient
+  // term of the scene. Its source is a lat-long radiance image in nits, built
+  // on the host from, in order of preference, the first mjLIGHT_IMAGE light's
+  // texture, the model's skybox, or -- failing both -- a two-colour gradient
+  // synthesized from MuJoCo's own ambient terms. Everything about it (the
+  // radiance, and the frame that puts MuJoCo's +z at the environment's zenith)
+  // is baked here: the light has no live intensity knob, and its node never
+  // moves, so UpdateLights skips it.
+  void BuildEnvironment(const mjModel* m, int image_light) {
+    // Pick the source texture, if any.
+    int texid = -1;
+    if (image_light >= 0 && m->light_texid[image_light] >= 0) {
+      texid = m->light_texid[image_light];
+    } else {
+      for (int i = 0; i < m->ntex; ++i) {
+        if (m->tex_type[i] == mjTEXTURE_SKYBOX) {
+          texid = i;
+          break;
+        }
+      }
+    }
+    bool cube = texid >= 0 && m->tex_type[texid] != mjTEXTURE_2D;
+    // Reject data this host-side sampler cannot read: KTX and other encoded
+    // textures are single-channel blobs (only the Filament renderer decodes
+    // them), and a cube whose faces are neither square-repeated nor a 6-face
+    // strip would be sampled out of bounds. Falling through to texid < 0
+    // synthesizes the gradient instead, which is strictly better than nothing.
+    if (texid >= 0) {
+      const int w = m->tex_width[texid], h = m->tex_height[texid];
+      const bool readable = m->tex_nchannel[texid] >= 3;
+      const bool sized = !cube || h == w || h == 6 * w;
+      if (!readable || !sized) {
+        mju_warning("bourbon: texture %d is unusable as an environment "
+                    "(%d channels, %dx%d); using a synthesized gradient",
+                    texid, m->tex_nchannel[texid], w, h);
+        texid = -1;
+        cube = false;
+      }
+    }
+
+    // Radiance calibration. A textured environment's [0,1] pixels are scaled
+    // to nits; an untextured one is a gradient whose upper hemisphere carries
+    // MuJoCo's ambient (see kSkyboxIrradianceFraction for the derivation of
+    // both). A uniform environment of radiance L delivers pi*L lux, hence the
+    // division.
+    const float reference = ReferenceIlluminance(m);
+    float nits = 0.0f;
+    Eigen::Array3f sky = Eigen::Array3f::Zero();
+    Eigen::Array3f ground = Eigen::Array3f::Zero();
+    if (texid >= 0) {
+      // An image light may state its own illuminance; otherwise fall back to
+      // the skybox calibration.
+      const float lux = (image_light >= 0 && m->light_intensity[image_light] > 0)
+                            ? m->light_intensity[image_light]
+                            : kSkyboxIrradianceFraction * reference;
+      nits = lux / kPi;
+    } else {
+      Eigen::Array3f ambient(m->vis.headlight.ambient[0],
+                             m->vis.headlight.ambient[1],
+                             m->vis.headlight.ambient[2]);
+      for (int i = 0; i < m->nlight; ++i) {
+        ambient += Eigen::Array3f(m->light_ambient[3 * i + 0],
+                                  m->light_ambient[3 * i + 1],
+                                  m->light_ambient[3 * i + 2]);
+      }
+      if (ambient.maxCoeff() <= 0.0f) return;  // nothing to contribute
+      // Tint by the haze colour, which is what MuJoCo authors reach for to
+      // colour the air; it defaults to white, so this is a no-op by default.
+      const Eigen::Array3f haze(m->vis.rgba.haze[0], m->vis.rgba.haze[1],
+                                m->vis.rgba.haze[2]);
+      sky = ambient * haze * reference / kPi;
+      ground = sky * kEnvGroundFraction;
+    }
+
+    // Rasterize the lat-long source image. Pixel (x,y) is the radiance arriving
+    // from the direction that MaterialX's projection maps to its centre, taken
+    // back into world space through the light's own frame.
+    const unsigned height = kEnvSourceHeight;
+    const unsigned width = 2 * height;
+    const Eigen::Matrix3f env_to_world = EnvironmentFrame().linear();
+    std::vector<Eigen::Array4f> pixels(static_cast<size_t>(width) * height);
+    for (unsigned y = 0; y < height; ++y) {
+      for (unsigned x = 0; x < width; ++x) {
+        const Eigen::Vector3f obj =
+            LatLongDirection((x + 0.5f) / width, (y + 0.5f) / height);
+        const Eigen::Vector3f dir = env_to_world * obj;
+        Eigen::Array3f c;
+        if (texid >= 0) {
+          // Cube textures are sampled in object space (MuJoCo's skybox cubes
+          // are y-up, which is this light's own frame); an equirectangular 2D
+          // texture in world space, where up is MuJoCo's +z.
+          c = nits * (cube ? SampleCubeTexture(m, texid, obj)
+                           : SampleLatLongTexture(m, texid, dir));
+        } else {
+          // Smoothstep in the world z cosine: a soft horizon, so the gradient
+          // reads as a sky dome over a ground plane rather than a hard seam.
+          const float t = 0.5f * (dir.z() + 1.0f);
+          const float w = t * t * (3.0f - 2.0f * t);
+          c = ground + (sky - ground) * w;
+        }
+        pixels[static_cast<size_t>(y) * width + x] =
+            Eigen::Array4f(c[0], c[1], c[2], 1.0f);
+      }
+    }
+
+    bourbon::TextureMap2D::Params image_params;
+    image_params.source = bourbon::TextureMap2D::HostSource{
+        .format = MTL::PixelFormatRGBA32Float,
+        .size = {width, height},
+        .pixels = pixels.data(),
+    };
+    image_params.sampler.min_filter = MTL::SamplerMinMagFilterLinear;
+    image_params.sampler.mag_filter = MTL::SamplerMinMagFilterLinear;
+    env_source_image = bourbon::TextureMap2D::Create(
+        image_params, *model_heap, *model_graph, *sg_context);
+
+    Light L;
+    L.is_environment = true;
+    L.kind = bourbon::SGObjectKind::LatLongEnvironmentLight;
+    L.source = bourbon::LatLongEnvironmentLight::Create(
+        {.image = env_source_image,
+         .irradiance_map_height = kEnvIrradianceHeight,
+         .irradiance_map_sample_count = kEnvIrradianceSampleCount,
+         .radiance_map_height = kEnvRadianceHeight},
+        *model_heap, *model_graph, *sg_context);
+    AttachLight(L);
+    L.xform->local_matrix().setValue(EnvironmentFrame());
+    lights.push_back(std::move(L));
   }
 
   // Per-frame light update: pushes each light's world placement (via its node
@@ -1044,7 +1350,8 @@ struct BourbonContext::Impl {
     const int n = static_cast<int>(lights.size());
     for (int i = 0; i < n; ++i) {
       Light& L = lights[i];
-      if (!L.source) continue;  // image-light slot, not yet supported
+      if (!L.source) continue;      // mjLIGHT_IMAGE slot; see BuildEnvironment
+      if (L.is_environment) continue;  // static frame and radiance
       if (L.is_headlight) {
         const bool active = m->vis.headlight.active != 0;
         const Eigen::Array3f rgb(m->vis.headlight.diffuse[0],
