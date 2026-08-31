@@ -998,6 +998,12 @@ struct Renderable {
   // material is bound at addShape and has no setter, so a swap is a
   // removeSGObject + addShape pair).
   bourbon::ShapeInstance* shape_instance = nullptr;
+  // A second ShapeInstance on the same node carrying the shared highlight
+  // material, added while this geom's body is selected and removed on deselect.
+  // Non-null iff the geom is currently highlighted. This is the proper way to
+  // show selection (one extra object, no material mutation, survives a material
+  // swap), not Filament's emission-compare hack.
+  bourbon::ShapeInstance* highlight_instance = nullptr;
 
   // Transparency state. A Pattern's SemiTransparencyKind is fixed at
   // construction (Pattern only exposes getSemiTransparency()), so a geom that
@@ -1347,6 +1353,12 @@ constexpr float kLineBoxThicknessFraction = 0.0015f;
 // extra_geoms append loop caps against it.
 constexpr int kDecorSceneMaxGeom = 10000;
 
+// Selection highlight: a warm additive glow blended over the selected body.
+// baseColor is black and the colour rides the emissive term (bourbon has no
+// unlit BXDF), at a modest alpha so the body still reads through the glow.
+constexpr float kHighlightColor[3] = {1.0f, 0.75f, 0.25f};
+constexpr float kHighlightAlpha = 0.45f;
+
 // Fills `out` with the part layout for decoration geom `geom` (sizes in the
 // mjvGeom convention: size[2] is the capsule/cylinder half-length, NOT size[1]
 // -- see engine_vis_visualize.c:327 and the plan's R4). `scene_extent` scales
@@ -1611,6 +1623,13 @@ struct BourbonContext::Impl {
   float decor_emissive_nits = 0.0f;
   bourbon::RefPtr<bourbon::Shape> unit_triangle_shape;  // shared by all triangles
 
+  // Selection highlight: a shared unlit-glow material added as a second
+  // ShapeInstance on every geom of the selected body. `highlighted_body` is the
+  // body currently highlighted (-1 = none), so the set is only reworked when the
+  // selection actually changes.
+  bourbon::RefPtr<bourbon::Material> highlight_material;
+  int highlighted_body = -1;
+
   // Retained lights: one per mjModel light (an mjLIGHT_IMAGE slot is left
   // source-less -- its texture drives the environment light instead), then the
   // headlight, then at most one environment light. Only the first nlight
@@ -1796,6 +1815,8 @@ struct BourbonContext::Impl {
     pbr_pattern = nullptr;
     lights.clear();
     env_source_image.reset();
+    highlight_material.reset();
+    highlighted_body = -1;
     // Decoration pool: the nodes were just destroyed by destroyAllRootNodes, so
     // drop the (now dangling) slot bookkeeping and free the private scene, which
     // is model-specific and remade on the next Init.
@@ -2014,6 +2035,42 @@ struct BourbonContext::Impl {
     // brightness under the camera's photometric exposure (a diffuse-white
     // surface fully lit by the reference light returns ~reference/pi nits).
     decor_emissive_nits = ReferenceIlluminance(m) / kPi;
+
+    // Shared selection-highlight material: a translucent warm glow, emissive so
+    // it is unaffected by lighting, blended so the selected body reads through.
+    {
+      const float nits = decor_emissive_nits;
+      const Eigen::Array4f base_color(0.0f, 0.0f, 0.0f, kHighlightAlpha);
+      const Eigen::Array4f emissive(kHighlightColor[0] * nits,
+                                    kHighlightColor[1] * nits,
+                                    kHighlightColor[2] * nits, 0.0f);
+      const Eigen::Array4f specular(0.0f, 0.0f, 0.0f, 0.0f);
+      const Eigen::Array4f sheen(0.0f, 0.0f, 0.0f, 0.0f);
+      const float metallic = 0.0f, roughness = 1.0f, ior = kDefaultIor;
+      const float alpha = kHighlightAlpha, transmission = 0.0f;
+      const float alpha_cutoff = 0.5f;
+      const int32_t alpha_mode = 2;  // BLEND
+      using bourbon::Token;
+      const bourbon::Pattern::Params params = {
+          {Token::Get("baseColor"), &base_color},
+          {Token::Get("metallic"), &metallic},
+          {Token::Get("roughness"), &roughness},
+          {Token::Get("transmission"), &transmission},
+          {Token::Get("specular"), &specular},
+          {Token::Get("ior"), &ior},
+          {Token::Get("alpha"), &alpha},
+          {Token::Get("alpha_mode"), &alpha_mode},
+          {Token::Get("alpha_cutoff"), &alpha_cutoff},
+          {Token::Get("sheen"), &sheen},
+          {Token::Get("emissive"), &emissive},
+      };
+      highlight_material = bourbon::Material::Create(
+          pbr_bxdf,
+          bourbon::Pattern::Create(*pbr_pattern, params, {},
+                                   bourbon::SemiTransparencyKind::Blend, h, g,
+                                   sg),
+          h, g, sg);
+    }
 
     // Report unreadable textures once for the model rather than once per geom
     // that references one; MaterialSpecForGeom then skips them silently.
@@ -2512,6 +2569,35 @@ struct BourbonContext::Impl {
       any = any || (L.shadow_instance != nullptr);
     }
     return any;
+  }
+
+  // Syncs the selection highlight to `select` (a body id, or <=0 for none), the
+  // value app.cc sets from a pick. Every geom of the selected body gets a second
+  // ShapeInstance carrying the shared glow material; deselecting removes them.
+  // Only reworked when the selection changes (adding/removing instances mutates
+  // shape morphology, so a change re-primes shadows). Returns true on a change.
+  bool UpdateSelection(const mjModel* m, int select) {
+    const int body = select > 0 ? select : -1;
+    if (body == highlighted_body) return false;
+    highlighted_body = body;
+    bool changed = false;
+    for (int i = 0; i < static_cast<int>(geoms.size()); ++i) {
+      Renderable& r = geoms[i];
+      if (!r.node) continue;
+      const bool want = body >= 0 && m->geom_bodyid[i] == body;
+      if (want && !r.highlight_instance) {
+        r.highlight_instance = r.node->addShape(
+            r.shape, highlight_material, *model_heap, *model_graph, *sg_context);
+        any_transparent = true;  // the glow is a Blend material; engage OIT
+        changed = true;
+      } else if (!want && r.highlight_instance) {
+        r.node->removeSGObject(r.highlight_instance);
+        r.highlight_instance = nullptr;
+        changed = true;
+      }
+    }
+    if (changed) primed = false;
+    return changed;
   }
 
   // --- Decoration pool -------------------------------------------------------
@@ -3049,6 +3135,12 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
         vis_option != nullptr && vis_option->flags[mjVIS_TRANSPARENT] != 0;
     if (model != nullptr && s.UpdateTransparency(model, transparent)) {
       s.primed = false;
+    }
+    // Selection highlight: add/remove the glow overlay on the selected body.
+    // Also mutates morphology (and may engage OIT), so it runs before the OIT
+    // decision and the model-graph evaluation below.
+    if (model != nullptr) {
+      s.UpdateSelection(model, perturb != nullptr ? perturb->select : -1);
     }
     // Order-independent transparency is structural (see `built_oit`): enable it
     // as soon as the scene has, or could have, a blended geom. Both inputs are
