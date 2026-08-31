@@ -1554,6 +1554,11 @@ struct BourbonContext::Impl {
   // Camera + projection (live via DGInputs, updated per frame).
   bourbon::RefPtr<bourbon::MatrixProjection> projection;
   bourbon::RefPtr<bourbon::Camera> camera;
+  // World->clip matrix (projection * view) for the current frame, used to place
+  // geom labels in the ImGui overlay. `camera_valid` is set each frame the
+  // camera block runs; a frame with no camera leaves labels un-drawn.
+  Eigen::Matrix4f clip_from_world = Eigen::Matrix4f::Identity();
+  bool camera_valid = false;
 
   // Draw submission and pipeline tables.
   std::unique_ptr<bourbon::DrawSubmission> draw_submission;
@@ -2941,6 +2946,44 @@ struct BourbonContext::Impl {
       HideDecorSlot(decor_slots[s]);
     }
   }
+
+  // Draws geom labels into the ImGui background draw list. Labels are populated
+  // on the private mjvScene's geoms by mjv_updateScene (run in UpdateDecorations)
+  // whenever the option's label mode is not mjLABEL_NONE, so this reads
+  // decor_scene directly. Each world position is projected with the frame's
+  // clip_from_world; points behind the camera (w<=0) or outside the NDC cube are
+  // skipped. Bourbon has no text path (plan R6), so this is the label renderer.
+  // Must run inside the ImGui frame, before ImGui::Render().
+  void DrawLabels(const mjvOption* opt) {
+    if (!camera_valid || !decor_scene_made) return;
+    if (!opt || opt->label == mjLABEL_NONE) return;
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImU32 kWhite = IM_COL32(255, 255, 255, 255);
+    const ImU32 kShadow = IM_COL32(0, 0, 0, 200);
+    for (int i = 0; i < decor_scene.ngeom; ++i) {
+      const mjvGeom& geom = decor_scene.geoms[i];
+      if (geom.label[0] == '\0') continue;
+      const Eigen::Vector4f clip =
+          clip_from_world *
+          Eigen::Vector4f(geom.pos[0], geom.pos[1], geom.pos[2], 1.0f);
+      if (clip.w() <= 0.0f) continue;  // behind the camera
+      const float ndc_x = clip.x() / clip.w();
+      const float ndc_y = clip.y() / clip.w();
+      const float ndc_z = clip.z() / clip.w();
+      if (ndc_x < -1.0f || ndc_x > 1.0f || ndc_y < -1.0f || ndc_y > 1.0f ||
+          ndc_z < -1.0f || ndc_z > 1.0f) {
+        continue;
+      }
+      // NDC (y up) -> ImGui window coords (y down), centred horizontally.
+      const float sx = (ndc_x * 0.5f + 0.5f) * disp.x;
+      const float sy = (0.5f - ndc_y * 0.5f) * disp.y;
+      const ImVec2 size = ImGui::CalcTextSize(geom.label);
+      const ImVec2 pos(sx - size.x * 0.5f, sy);
+      dl->AddText(ImVec2(pos.x + 1.0f, pos.y + 1.0f), kShadow, geom.label);
+      dl->AddText(pos, kWhite, geom.label);
+    }
+  }
 };
 
 BourbonContext::BourbonContext(void* metal_layer)
@@ -3081,7 +3124,9 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
 
   s.ui_framebuffer->setColorAttachment(0, drawable->image());
   ImGui_ImplMetalCPP_NewFrame(s.ui_framebuffer->metal_render_pass_descriptor());
-  ImGui::Render();
+  // ImGui::Render() is deferred until after the label overlay is injected below
+  // (labels need the frame's clip_from_world and the updated decoration scene).
+  s.camera_valid = false;
 
   auto frame_commands = bourbon::CommandBuffer::Create(*s.queue, *s.core);
 
@@ -3120,6 +3165,10 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
             p, p.inverse()});
     s.integrator->setDepthRange(near, far);
 
+    // Cache world->clip for label projection in the ImGui overlay.
+    s.clip_from_world = p * world_to_eye;
+    s.camera_valid = true;
+
     // Update the model's lights + headlight (the headlight rides the camera).
     s.UpdateLights(model, data, eye, fwd);
   }
@@ -3143,6 +3192,11 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
   // structure, so it must precede the model-graph evaluation below.
   s.UpdateDecorations(model, data, perturb, mj_camera, vis_option, extra_geoms,
                       num_extra_geoms);
+
+  // Inject geom labels into the ImGui background draw list, then finalize the
+  // ImGui frame. Both must happen before the drawable is composited below.
+  s.DrawLabels(vis_option);
+  ImGui::Render();
 
   // Bourbon's forward pass graph dereferences the world's shape-index buffer
   // unconditionally, and that buffer is a null (unallocated) DevicePtr when the
