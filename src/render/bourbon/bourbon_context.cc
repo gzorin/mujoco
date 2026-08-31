@@ -2884,14 +2884,21 @@ struct BourbonContext::Impl {
     const Eigen::Array4f base_color(0.0f, 0.0f, 0.0f, rgba[3]);
     const float alpha = rgba[3];
     using bourbon::Token;
+    // NOTE: DGSpanInput now has BOTH setValue(const void*) (raw bytes, copies
+    // size() bytes) and a templated setValue(const T&) (asserts size()==sizeof
+    // (T)). Passing a bare `&emissive` deduces T = Array4f const* and binds the
+    // template -- it then asserts sizeof(pointer)==16 and aborts. Cast to
+    // const void* to select the raw-bytes overload, which is what these
+    // param slices (Array4f / float) expect. (Bourbon R1 churn: the template
+    // overload is newer than this call site.)
     if (auto* e = part.pattern->findParam(Token::Get("emissive"))) {
-      e->setValue(&emissive);
+      e->setValue(static_cast<const void*>(&emissive));
     }
     if (auto* b = part.pattern->findParam(Token::Get("baseColor"))) {
-      b->setValue(&base_color);
+      b->setValue(static_cast<const void*>(&base_color));
     }
     if (auto* a = part.pattern->findParam(Token::Get("alpha"))) {
-      a->setValue(&alpha);
+      a->setValue(static_cast<const void*>(&alpha));
     }
   }
 
