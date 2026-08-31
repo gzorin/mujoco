@@ -42,7 +42,7 @@ void BourbonRenderer::Render(const mjModel* model, mjData* data,
                              const mjvOption* vis_option, int width, int height,
                              std::span<std::byte> pixels,
                              std::span<mjvGeom> extra_geoms) {
-  context_->RenderFrame(model, data, camera, width, height,
+  context_->RenderFrame(model, data, camera, vis_option, width, height,
                         render_flags_[mjRND_SHADOW] != 0);
 }
 

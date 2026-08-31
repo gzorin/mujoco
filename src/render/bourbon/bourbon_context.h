@@ -52,9 +52,11 @@ class BourbonContext {
   // then presents. Owns the ImGui::Render() call. The caller must have built the
   // ImGui frame (ImGui::NewFrame ... widgets) beforehand. `shadow_enabled`
   // (mjRND_SHADOW) toggles shadow casting; enabling it switches the pass graph
-  // onto a non-Direct submission mode.
+  // onto a non-Direct submission mode. `vis_option` may be null; mjVIS_TRANSPARENT
+  // is read from it to fade dynamic geoms.
   void RenderFrame(const mjModel* model, mjData* data, mjvCamera* camera,
-                   int width, int height, bool shadow_enabled);
+                   const mjvOption* vis_option, int width, int height,
+                   bool shadow_enabled);
 
   // Frames-per-second, exponentially smoothed.
   double GetFps() const;

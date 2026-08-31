@@ -146,18 +146,6 @@ bourbon::DeviceImage<2>::Extent ToExtent(CGSize size) {
                                          static_cast<unsigned>(size.height)};
 }
 
-// A retained scene element: an owned SGNode with a rigid transform, a shared
-// shape, and a material. Sizes are baked into the shape's parameters and the
-// node transform is kept strictly rigid (rotation + translation), which is
-// required for the ray-marched SDF primitives (a node scale would break their
-// distance field; see the plan's R2).
-struct Renderable {
-  bourbon::SGNode* node = nullptr;  // owned by world->model()
-  bourbon::RefPtr<bourbon::MatrixTransformer> xform;
-  bourbon::RefPtr<bourbon::Shape> shape;
-  bourbon::RefPtr<bourbon::Material> material;
-};
-
 // A retained light: an owned SGNode whose transform places/orients the light
 // each frame (bourbon lights read position/direction from the node transform,
 // not from world-space params). `kind` selects the concrete downcast for the
@@ -835,10 +823,13 @@ struct MaterialSpec {
     std::array<int32_t, 16> scalars{};
     std::array<ImageKey, 4> maps{};
     std::array<int32_t, 12> texgen{};
+    // Two materials over the same parameters but different blend behaviour are
+    // distinct Patterns, so the kind is part of the identity.
+    int semi_transparency = 0;
     auto operator<=>(const Key&) const = default;
   };
 
-  Key key() const {
+  Key key(bourbon::SemiTransparencyKind semi_transparency) const {
     auto q = [](float v) {
       return static_cast<int32_t>(std::lround(v * 4096.0f));
     };
@@ -848,7 +839,8 @@ struct MaterialSpec {
          q(emissive[0]), q(emissive[1]), q(emissive[2]), q(emissive[3]),
          q(metallic), q(roughness), q(ior), q(alpha)},
         {base_color_map, metallic_roughness_map, normal_map, emissive_map},
-        texgen.Key()};
+        texgen.Key(),
+        static_cast<int>(semi_transparency)};
   }
 };
 
@@ -971,6 +963,40 @@ MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
   }
   return spec;
 }
+
+// The alpha geom `i` renders with. mjVIS_TRANSPARENT fades dynamic-category
+// geoms by vis.map.alpha, exactly as setMaterial does
+// (engine_vis_visualize.c:251); a body is static, and so exempt, when it is
+// welded to the world (bodycategory, :156).
+bool IsDynamicGeom(const mjModel* m, int i) {
+  return m->body_weldid[m->geom_bodyid[i]] != 0;
+}
+
+// A retained scene element: an owned SGNode with a rigid transform, a shared
+// shape, and a material. Sizes are baked into the shape's parameters and the
+// node transform is kept strictly rigid (rotation + translation), which is
+// required for the ray-marched SDF primitives (a node scale would break their
+// distance field; see the plan's R2).
+struct Renderable {
+  bourbon::SGNode* node = nullptr;  // owned by world->model()
+  bourbon::RefPtr<bourbon::MatrixTransformer> xform;
+  bourbon::RefPtr<bourbon::Shape> shape;
+  bourbon::RefPtr<bourbon::Material> material;
+  // Owned by `node`; held so the material can be swapped (a ShapeInstance's
+  // material is bound at addShape and has no setter, so a swap is a
+  // removeSGObject + addShape pair).
+  bourbon::ShapeInstance* shape_instance = nullptr;
+
+  // Transparency state. A Pattern's SemiTransparencyKind is fixed at
+  // construction (Pattern only exposes getSemiTransparency()), so a geom that
+  // becomes translucent needs a second, Blend-built material rather than a
+  // mutated one. `spec` is the geom's parameter set at its authored (unfaded)
+  // alpha; `applied_alpha` and `blended` describe the material currently bound.
+  MaterialSpec spec;
+  bool dynamic = false;  // mjCAT_DYNAMIC: mjVIS_TRANSPARENT fades this geom
+  bool blended = false;
+  float applied_alpha = 1.0f;
+};
 
 // A de-indexed triangle soup (3 vertices per triangle) staged on the host
 // before upload as a bourbon TriangleMesh. Normals are always supplied;
@@ -1297,9 +1323,17 @@ struct BourbonContext::Impl {
   // shadow task bakes one encode chain per shadow source at construction, so an
   // add/remove of a shadow source (reflected in shadow_source_morphology) is
   // structural. `built_valid` is false until the first build.
+  // The order-independent transparency mode is also structural: the integrator
+  // captures it at construction, and with OITKind::None both the forward
+  // integration and viz passes SKIP every Blend pipeline outright
+  // (ForwardIntegrationPass.cpp:232), so a translucent geom would simply not be
+  // drawn. It is derived from the scene and the mjVIS_TRANSPARENT flag, never
+  // from anything that moves per frame (see the plan's R7).
   bool built_valid = false;
   bourbon::DrawSubmission::Mode built_mode = bourbon::DrawSubmission::Mode::Direct;
   uint64_t built_shadow_morphology = 0;
+  bourbon::OITKind built_oit = bourbon::OITKind::None;
+  bourbon::OITKind oit = bourbon::OITKind::None;
 
   // Whether IndirectDraws' persistent device buffer has been produced by at
   // least one shadowless render drain. IndirectDraws produces that buffer only
@@ -1324,6 +1358,12 @@ struct BourbonContext::Impl {
   // unsupported geom types have a null node), plus a material cache keyed on
   // the quantized glTF-PBR parameter set.
   std::vector<Renderable> geoms;
+  // Whether any geom is currently bound to a Blend material. Drives the OIT
+  // mode, hence the pass graph, so it is deliberately sticky within a model:
+  // it goes true as soon as a translucent geom appears and only resets on Init.
+  // That keeps a body fading in and out of translucency from rebuilding the
+  // pass graph repeatedly.
+  bool any_transparent = false;
   const bourbon::BXDFClass* pbr_bxdf = nullptr;
   const bourbon::PatternClass* pbr_pattern = nullptr;
   std::map<MaterialSpec::Key, bourbon::RefPtr<bourbon::Material>>
@@ -1377,7 +1417,7 @@ struct BourbonContext::Impl {
         .color_format = kColorFormat,
         .depth_format = kDepthFormat,
         .sample_count = 1,
-        .oit = bourbon::OITKind::None,
+        .oit = oit,
         .tap = bourbon::Tap::Color,
         .clustered = false,
     };
@@ -1399,6 +1439,7 @@ struct BourbonContext::Impl {
         integrator->output(), *camera, *render_graph, *renderer_context);
 
     built_mode = mode;
+    built_oit = oit;
     built_valid = true;
   }
 
@@ -1515,6 +1556,7 @@ struct BourbonContext::Impl {
       world->model().destroyAllRootNodes();
     }
     geoms.clear();
+    any_transparent = false;
     material_cache.clear();
     texture_cache.clear();
     mesh_shape_cache.clear();
@@ -1652,15 +1694,21 @@ struct BourbonContext::Impl {
   // constructor memcpys into its argument block, so the pointed-to storage only
   // has to outlive this call.
   bourbon::RefPtr<bourbon::Material> GetOrCreateMaterial(
-      const mjModel* m, const MaterialSpec& spec) {
-    const MaterialSpec::Key key = spec.key();
+      const mjModel* m, const MaterialSpec& spec,
+      bourbon::SemiTransparencyKind semi_transparency) {
+    const MaterialSpec::Key key = spec.key(semi_transparency);
     auto it = material_cache.find(key);
     if (it != material_cache.end()) return it->second;
 
-    // OPAQUE. The gltf_pbr graph forces opacity to 1 in this mode, so `alpha`
-    // is carried but inert until transparency support flips both this and the
-    // Pattern's SemiTransparencyKind.
-    const int32_t alpha_mode = 0;
+    // glTF's alpha_mode (0 OPAQUE, 1 MASK, 2 BLEND) drives the BXDF's opacity
+    // -- the gltf_pbr graph forces opacity to 1 in OPAQUE mode, so a Blend
+    // pattern whose alpha_mode stayed 0 would be fully opaque. It is a separate
+    // knob from the Pattern's SemiTransparencyKind, which selects the pipeline
+    // blend state; both have to agree.
+    const int32_t alpha_mode =
+        semi_transparency == bourbon::SemiTransparencyKind::Blend  ? 2
+        : semi_transparency == bourbon::SemiTransparencyKind::Mask ? 1
+                                                                   : 0;
     const float alpha_cutoff = 0.5f;
     const float transmission = 0.0f;
     const Eigen::Array4f sheen = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1697,8 +1745,8 @@ struct BourbonContext::Impl {
     auto material = bourbon::Material::Create(
         pbr_bxdf,
         bourbon::Pattern::Create(*pbr_pattern, params, textures,
-                                 bourbon::SemiTransparencyKind::Opaque,
-                                 *model_heap, *model_graph, *sg_context),
+                                 semi_transparency, *model_heap, *model_graph,
+                                 *sg_context),
         *model_heap, *model_graph, *sg_context);
     material_cache[key] = material;
     return material;
@@ -1734,17 +1782,29 @@ struct BourbonContext::Impl {
     for (int i = 0; i < m->ngeom; ++i) {
       bourbon::RefPtr<bourbon::Shape> shape = MakeShapeForGeom(m, i);
       if (!shape) continue;
-      bourbon::RefPtr<bourbon::Material> material =
-          GetOrCreateMaterial(m, MaterialSpecForGeom(m, i));
+      const MaterialSpec spec = MaterialSpecForGeom(m, i);
+      // The authored alpha alone decides the initial blend behaviour;
+      // mjVIS_TRANSPARENT is a per-frame flag and is folded in by
+      // UpdateTransparency once the option set is known.
+      const bool blended = spec.alpha < 1.0f;
+      bourbon::RefPtr<bourbon::Material> material = GetOrCreateMaterial(
+          m, spec,
+          blended ? bourbon::SemiTransparencyKind::Blend
+                  : bourbon::SemiTransparencyKind::Opaque);
       bourbon::SGNode* node = scene.createNode();
       scene.addRootNode(*node);
       auto xform = bourbon::MatrixTransformer::Create(g);
       node->setTransformer(xform);
-      node->addShape(shape, material, h, g, sg);
+      geoms[i].shape_instance = node->addShape(shape, material, h, g, sg);
       geoms[i].node = node;
       geoms[i].xform = xform;
       geoms[i].shape = shape;
       geoms[i].material = material;
+      geoms[i].spec = spec;
+      geoms[i].dynamic = IsDynamicGeom(m, i);
+      geoms[i].blended = blended;
+      geoms[i].applied_alpha = spec.alpha;
+      if (blended) any_transparent = true;
     }
 
     BuildLights(m);
@@ -2139,6 +2199,53 @@ struct BourbonContext::Impl {
     L.shadow_instance = L.node->addShadowSource(L.shadow, h, g, sg);
   }
 
+  // Rebinds any geom whose effective alpha no longer matches the material it
+  // holds, and reports whether it rebound anything.
+  //
+  // A Pattern's SemiTransparencyKind is a construction argument with no setter,
+  // and a ShapeInstance's material is bound by addShape with no setter either,
+  // so becoming translucent means building a second material and swapping the
+  // instance -- never mutating the Pattern. GetOrCreateMaterial keys on the
+  // kind, so the opaque and blend variants coexist in the cache and a geom that
+  // fades in and out only pays for the swap.
+  //
+  // `transparent` is mjVIS_TRANSPARENT, which fades dynamic-category geoms by
+  // vis.map.alpha (setMaterial, engine_vis_visualize.c:251). It is a
+  // user-toggled flag, so the alpha it produces is stable frame to frame; the
+  // comparisons below are what keep this from touching the scene graph every
+  // frame.
+  bool UpdateTransparency(const mjModel* m, bool transparent) {
+    const float fade = static_cast<float>(m->vis.map.alpha);
+    bool swapped = false;
+    for (int i = 0; i < static_cast<int>(geoms.size()); ++i) {
+      Renderable& r = geoms[i];
+      if (!r.node) continue;
+      float alpha = r.spec.base_color[3];
+      if (transparent && r.dynamic) alpha *= fade;
+      const bool blend = alpha < 1.0f;
+      if (blend == r.blended && alpha == r.applied_alpha) continue;
+
+      MaterialSpec spec = r.spec;
+      spec.base_color[3] = alpha;
+      spec.alpha = alpha;
+      auto material = GetOrCreateMaterial(
+          m, spec,
+          blend ? bourbon::SemiTransparencyKind::Blend
+                : bourbon::SemiTransparencyKind::Opaque);
+
+      r.node->removeSGObject(r.shape_instance);
+      r.shape_instance =
+          r.node->addShape(r.shape, material, *model_heap, *model_graph,
+                           *sg_context);
+      r.material = material;
+      r.blended = blend;
+      r.applied_alpha = alpha;
+      if (blend) any_transparent = true;
+      swapped = true;
+    }
+    return swapped;
+  }
+
   // Adds/removes shadow sources to match the global shadow enable (mjRND_SHADOW)
   // for every shadow-casting model light (the headlight never casts). Mutates
   // the model graph structure (shadow_source_morphology), so it must run before
@@ -2280,8 +2387,9 @@ void BourbonContext::SetClearColor(float r, float g, float b, float a) {
 }
 
 void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
-                                 mjvCamera* mj_camera, int width, int height,
-                                 bool shadow_enabled) {
+                                 mjvCamera* mj_camera,
+                                 const mjvOption* vis_option, int width,
+                                 int height, bool shadow_enabled) {
   Impl& s = *impl_;
 
   // Must be first each frame.
@@ -2355,6 +2463,25 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
   // DepthAndBXDFTask. Skip the scene passes for an empty scene and just
   // composite ImGui, so an all-unsupported-geom model does not crash.
   if (s.HasShapes()) {
+    // --- Sync per-geom transparency. This can rebind ShapeInstances, which
+    // re-publishes shape_kind_morphology (the multiset value comes back to
+    // where it was, but DGSource dirties on each assign), and a dirty shape
+    // morphology re-runs IndirectDraws stage 1 -- which reallocates the buffer
+    // the shadow cull binds. That is exactly the collision `primed` exists to
+    // avoid, so a swap re-primes: this frame renders shadowless, the next
+    // restores them.
+    const bool transparent =
+        vis_option != nullptr && vis_option->flags[mjVIS_TRANSPARENT] != 0;
+    if (model != nullptr && s.UpdateTransparency(model, transparent)) {
+      s.primed = false;
+    }
+    // Order-independent transparency is structural (see `built_oit`): enable it
+    // as soon as the scene has, or could have, a blended geom. Both inputs are
+    // stable frame to frame -- `any_transparent` is sticky per model and the
+    // flag is user-toggled -- so this cannot thrash the pass graph.
+    s.oit = (s.any_transparent || transparent) ? bourbon::OITKind::MLAB
+                                               : bourbon::OITKind::None;
+
     // --- Sync shadow sources to the shadow enable. The submission mode stays
     // IndirectDrawsWithCull regardless (see the constructor): only the set of
     // shadow sources changes, which is what gates the pass-graph rebuild below.
@@ -2378,7 +2505,7 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     // pushed every frame so the submission back-end matches the built graph.
     const uint64_t morphology = s.world->shadow_source_morphology().value();
     if (!s.built_valid || s.built_mode != desired_mode ||
-        s.built_shadow_morphology != morphology) {
+        s.built_shadow_morphology != morphology || s.built_oit != s.oit) {
       s.RebuildPassGraph(desired_mode, morphology);
     }
     s.draw_submission->setMode(desired_mode);
