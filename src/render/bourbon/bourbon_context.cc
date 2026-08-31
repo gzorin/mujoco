@@ -14,6 +14,7 @@
 
 #include "render/bourbon/bourbon_context.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -78,6 +79,9 @@
 #include <BourbonSG/ShapeVarKind.h>
 #include <BourbonSG/Shapes/SDF3D.h>
 #include <BourbonSG/Shapes/TriangleMesh.h>
+#include <BourbonSG/TextureMapSet.h>
+#include <BourbonSG/TextureMaps/CubeTextureMap.h>
+#include <BourbonSG/TextureMaps/TextureCoordMaps.h>
 #include <BourbonSG/TextureMaps/TextureMap2D.h>
 
 #include <BourbonCore/Token.h>
@@ -465,6 +469,339 @@ constexpr float kDefaultShininess = 0.5f;
 
 float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
+// --- Textures ----------------------------------------------------------------
+
+// How a geom's texture coordinates are produced.
+//
+// bourbon's SDF shapes emit no `st` -- SDF3D.metal never writes the surface
+// Geometry's st field, so MaterialGlobals::uv is zero on every ray-marched
+// primitive. A texture on a MuJoCo primitive therefore has to be projected from
+// the object-space hit position, which is what bourbon's Planar/Spherical/
+// Cylindrical coord maps do. Meshes with texcoords, and the plane and height
+// field geometry we generate ourselves, carry real UVs and only need the
+// texrepeat scale, which TransformUVCoordMap applies (to the derivatives too,
+// so mip selection stays correct).
+struct TexGen {
+  enum class Kind { Uv, Planar, Spherical, Cylindrical };
+  Kind kind = Kind::Uv;
+  // Uv: st -> scale * st + offset.
+  Eigen::Array2f scale = {1.0f, 1.0f};
+  Eigen::Array2f offset = {0.0f, 0.0f};
+  // Planar: the object-space xy extent one texture tile spans.
+  Eigen::Array2f extent = {1.0f, 1.0f};
+  float radius = 1.0f;  // Spherical: object z at the pole.
+  float height = 1.0f;  // Cylindrical: object z span of one tile.
+  // Cube textures ignore everything above and sample with a scaled object-space
+  // position, matching the classic renderer's object-linear cube texgen
+  // (render_gl3.c:225-230).
+  Eigen::Array3f cube_scale = {1.0f, 1.0f, 1.0f};
+
+  std::array<int32_t, 12> Key() const {
+    auto q = [](float v) {
+      return static_cast<int32_t>(std::lround(v * 4096.0f));
+    };
+    return {static_cast<int32_t>(kind),
+            q(scale[0]),      q(scale[1]),      q(offset[0]),
+            q(offset[1]),     q(extent[0]),     q(extent[1]),
+            q(radius),        q(height),        q(cube_scale[0]),
+            q(cube_scale[1]), q(cube_scale[2])};
+  }
+};
+
+// Derives the coordinate generation for geom `i` from its type, its size and
+// the material's mat_texrepeat/mat_texuniform.
+//
+// LIMITATION: the spherical and cylindrical coord maps have no post-transform
+// on their output st, and bourbon does not chain coord maps, so mat_texrepeat
+// cannot be applied to a projected sphere, ellipsoid, capsule or cylinder. (A
+// scale+offset on TextureCoordMap2D's output would remove this; worth flagging
+// upstream.) Every other path honours it.
+TexGen TexGenForGeom(const mjModel* m, int i) {
+  TexGen tg;
+  const int matid = m->geom_matid[i];
+  const float rep0 = matid >= 0 ? m->mat_texrepeat[2 * matid + 0] : 1.0f;
+  const float rep1 = matid >= 0 ? m->mat_texrepeat[2 * matid + 1] : 1.0f;
+  const bool uniform = matid >= 0 && m->mat_texuniform[matid] != 0;
+  const mjtNum* size = m->geom_size + 3 * i;
+  const float sx = static_cast<float>(size[0]);
+  const float sy = static_cast<float>(size[1]);
+  const float sz = static_cast<float>(size[2]);
+
+  tg.cube_scale = uniform ? Eigen::Array3f(sx, sy, sz)
+                          : Eigen::Array3f(1.0f, 1.0f, 1.0f);
+
+  // Mirrors the classic renderer's explicit-UV branch (render_gl3.c:130-136): a
+  // non-positive repeat means 1, and texuniform re-expresses the repeat in
+  // spatial units by multiplying in the geom's own half-extents.
+  Eigen::Array2f uv_scale(rep0 > 0.0f ? rep0 : 1.0f, rep1 > 0.0f ? rep1 : 1.0f);
+  if (uniform) {
+    if (sx > 0.0f) uv_scale[0] *= sx;
+    if (sy > 0.0f) uv_scale[1] *= sy;
+  }
+  // One tile per `rep` over the geom's full extent, or per unit length when
+  // texuniform asks for a size-independent scale.
+  auto tile = [&](float rep, float half) {
+    const float r = rep > 0.0f ? rep : 1.0f;
+    if (uniform) return 1.0f / r;
+    return half > 0.0f ? 2.0f * half / r : 1.0f / r;
+  };
+
+  switch (m->geom_type[i]) {
+    case mjGEOM_PLANE:
+      tg.kind = TexGen::Kind::Uv;
+      tg.scale = uv_scale;
+      // BuildPlaneGeometry gives an infinite dimension world-unit UVs rather
+      // than 0..1, so the tile size is absolute; the classic renderer then
+      // recentres by half a tile (render_gl3.c:145-147).
+      if (size[0] <= 0 || size[1] <= 0) tg.offset = {-0.5f, -0.5f};
+      break;
+    case mjGEOM_HFIELD:
+      tg.kind = TexGen::Kind::Uv;
+      tg.scale = uv_scale;
+      break;
+    case mjGEOM_MESH: {
+      const int meshid = m->geom_dataid[i];
+      if (meshid >= 0 && m->mesh_texcoordadr[meshid] >= 0) {
+        tg.kind = TexGen::Kind::Uv;
+        tg.scale = uv_scale;
+      } else {
+        tg.kind = TexGen::Kind::Planar;
+        tg.extent = {tile(rep0, sx), tile(rep1, sy)};
+      }
+    } break;
+    case mjGEOM_SPHERE:
+      tg.kind = TexGen::Kind::Spherical;
+      tg.radius = sx > 0.0f ? sx : 1.0f;
+      break;
+    case mjGEOM_ELLIPSOID:
+      // The polar coordinate is acos(z/radius), so the radius must be the
+      // object's z semi-axis for it to span the full 0..pi.
+      tg.kind = TexGen::Kind::Spherical;
+      tg.radius = sz > 0.0f ? sz : 1.0f;
+      break;
+    case mjGEOM_CAPSULE:
+    case mjGEOM_CYLINDER:
+      tg.kind = TexGen::Kind::Cylindrical;
+      tg.height = sy > 0.0f ? 2.0f * sy : 1.0f;
+      break;
+    default:
+      // Box and anything else: project along the object z axis, as the classic
+      // renderer does for every 2D-textured geom without UVs.
+      tg.kind = TexGen::Kind::Planar;
+      tg.extent = {tile(rep0, sx), tile(rep1, sy)};
+      break;
+  }
+  return tg;
+}
+
+// MuJoCo marks a KTX/compressed payload by storing it as a single-channel,
+// single-row blob (the same test the Filament renderer uses to select
+// mjPIXEL_FORMAT_KTX, model_objects.cc:501); only that renderer decodes them.
+bool IsEncodedTexture(const mjModel* m, int texid) {
+  const int nchannel = m->tex_nchannel[texid];
+  if (nchannel != 1 && nchannel != 3 && nchannel != 4) return true;
+  return nchannel == 1 && m->tex_height[texid] == 1;
+}
+
+// A host-staged RGBA8 image. A cube texture holds its six faces stacked in GL
+// order (+X,-X,+Y,-Y,+Z,-Z) -- both MuJoCo's own layout and Metal's cube slice
+// order -- and `width == height` is then one face's edge length.
+struct TextureImage {
+  std::vector<uint8_t> pixels;
+  unsigned width = 0;
+  unsigned height = 0;
+  bool cube = false;
+
+  bool empty() const { return pixels.empty(); }
+  size_t face_bytes() const {
+    return static_cast<size_t>(width) * height * 4;
+  }
+};
+
+// Expands mjModel texture `texid` into tightly packed RGBA8. Single-channel
+// data broadcasts to grey (MuJoCo stores roughness, metallic and occlusion maps
+// that way) and three-channel data gets an opaque alpha. A square
+// (height == width) cube texture is a single face repeated on all six, as the
+// classic renderer treats it (render_context.c:1525).
+TextureImage ReadTexture(const mjModel* m, int texid) {
+  TextureImage img;
+  const int nchannel = m->tex_nchannel[texid];
+  const unsigned w = m->tex_width[texid];
+  const unsigned h = m->tex_height[texid];
+  img.cube = m->tex_type[texid] != mjTEXTURE_2D;
+  img.width = w;
+  img.height = img.cube ? w : h;
+  const unsigned faces = img.cube ? 6 : 1;
+  const bool repeat_face = img.cube && h == w;
+  const mjtByte* src = m->tex_data + m->tex_adr[texid];
+  const size_t texels = static_cast<size_t>(img.width) * img.height;
+  img.pixels.resize(texels * 4 * faces);
+  uint8_t* dst = img.pixels.data();
+  for (unsigned f = 0; f < faces; ++f) {
+    const mjtByte* face =
+        src + (repeat_face ? 0 : static_cast<size_t>(f) * texels * nchannel);
+    for (size_t t = 0; t < texels; ++t) {
+      const mjtByte* p = face + t * nchannel;
+      dst[0] = p[0];
+      dst[1] = nchannel > 1 ? p[1] : p[0];
+      dst[2] = nchannel > 2 ? p[2] : p[0];
+      dst[3] = nchannel > 3 ? p[3] : 255;
+      dst += 4;
+    }
+  }
+  return img;
+}
+
+// True when two staged images can be combined channel-wise.
+bool SameShape(const TextureImage& a, const TextureImage& b) {
+  return a.width == b.width && a.height == b.height && a.cube == b.cube;
+}
+
+// How a staged host image is assembled from mjModel's per-role textures. Two
+// roles can name the same mjModel texture yet need different packing, so the
+// key carries the packing alongside the source ids. The packing also decides
+// whether the sampler sRGB-decodes: MuJoCo's colour space is a property of the
+// file, and a normal map stored in an sRGB-tagged PNG must still be read
+// linearly.
+enum class ImagePacking {
+  Color,      // `primary`, sRGB-decoded if the texture declares that space
+  Linear,     // `primary`, always read linearly (normal maps)
+  BaseColor,  // Color, plus `secondary` (OPACITY) folded into the alpha
+  Orm,        // `primary` (ORM), plus `secondary` (ROUGHNESS) into G and
+              // `tertiary` (METALLIC) into B; always linear
+};
+
+struct ImageKey {
+  ImagePacking packing = ImagePacking::Color;
+  int primary = -1;
+  int secondary = -1;
+  int tertiary = -1;
+  // Orm only. bourbon's glTFPbrPattern REPLACES the metallic and roughness
+  // uniforms with the map rather than multiplying them, whereas glTF (and
+  // MuJoCo, and the Filament renderer) treat the scalars as factors over the
+  // texture. So the scalars are baked into the staged image instead, and these
+  // are how: each byte scales its channel's texture (255 == x1.0), or stands in
+  // for the channel outright when that channel has no texture.
+  uint8_t mul_g = 255;  // roughness
+  uint8_t mul_b = 0;    // metallic
+
+  bool bound() const {
+    return primary >= 0 || secondary >= 0 || tertiary >= 0;
+  }
+  auto operator<=>(const ImageKey&) const = default;
+};
+
+// Quantizes a [0,1] scalar to the 8-bit channel value a synthesized ORM image
+// carries for it.
+uint8_t ToByte(float v) {
+  return static_cast<uint8_t>(std::lround(Clamp01(v) * 255.0f));
+}
+
+// Assembles the host image for `key`. Combining roles requires matching
+// dimensions -- MuJoCo imposes no such constraint, so a mismatch warns and the
+// offending contribution is dropped rather than sampled out of bounds.
+TextureImage StageImage(const mjModel* m, const ImageKey& key) {
+  switch (key.packing) {
+    case ImagePacking::Color:
+    case ImagePacking::Linear:
+      return key.primary >= 0 ? ReadTexture(m, key.primary) : TextureImage{};
+
+    case ImagePacking::BaseColor: {
+      TextureImage base = ReadTexture(m, key.primary);
+      if (key.secondary < 0) return base;
+      // glTFPbrPattern has no opacity slot: baseColorMap's alpha is the only
+      // place mjTEXROLE_OPACITY can land.
+      const TextureImage opacity = ReadTexture(m, key.secondary);
+      if (!SameShape(base, opacity)) {
+        mju_warning("bourbon: opacity texture %d (%ux%u) does not match base "
+                    "color texture %d (%ux%u); ignoring it",
+                    key.secondary, opacity.width, opacity.height, key.primary,
+                    base.width, base.height);
+        return base;
+      }
+      for (size_t t = 0; t * 4 < base.pixels.size(); ++t) {
+        base.pixels[t * 4 + 3] = opacity.pixels[t * 4];
+      }
+      return base;
+    }
+
+    case ImagePacking::Orm: {
+      // glTF ORM packing: R = occlusion, G = roughness, B = metallic, and the
+      // pattern reads .bg, i.e. (metallic, roughness). Occlusion is left at 255
+      // because the pattern has no occlusion input to route it to.
+      //
+      // A dedicated ROUGHNESS or METALLIC texture wins over an ORM texture's
+      // corresponding channel, and mul_g/mul_b apply the material's scalars
+      // (see ImageKey) since the shader will not.
+      const TextureImage orm_src =
+          key.primary >= 0 ? ReadTexture(m, key.primary) : TextureImage{};
+      const TextureImage rough_src =
+          key.secondary >= 0 ? ReadTexture(m, key.secondary) : TextureImage{};
+      const TextureImage metal_src =
+          key.tertiary >= 0 ? ReadTexture(m, key.tertiary) : TextureImage{};
+
+      TextureImage out;
+      for (const TextureImage* c : {&orm_src, &rough_src, &metal_src}) {
+        if (!c->empty()) {
+          out = *c;
+          break;
+        }
+      }
+      if (out.empty()) return {};
+
+      // A standalone roughness/metallic map is greyscale, so read its red;
+      // an ORM texture carries the value in its own glTF channel.
+      const TextureImage* rough =
+          !rough_src.empty() ? &rough_src
+                             : (!orm_src.empty() ? &orm_src : nullptr);
+      const int rough_channel = !rough_src.empty() ? 0 : 1;
+      const TextureImage* metal =
+          !metal_src.empty() ? &metal_src
+                             : (!orm_src.empty() ? &orm_src : nullptr);
+      const int metal_channel = !metal_src.empty() ? 0 : 2;
+
+      auto compatible = [&](const TextureImage* src, const char* what) {
+        if (!src || SameShape(out, *src)) return src;
+        mju_warning("bourbon: %s texture (%ux%u) does not match the rest of "
+                    "the material's roughness/metallic set (%ux%u); ignoring it",
+                    what, src->width, src->height, out.width, out.height);
+        return static_cast<const TextureImage*>(nullptr);
+      };
+      rough = compatible(rough, "roughness");
+      metal = compatible(metal, "metallic");
+
+      for (size_t t = 0, n = out.pixels.size() / 4; t < n; ++t) {
+        const unsigned g =
+            rough ? rough->pixels[t * 4 + rough_channel] * key.mul_g / 255
+                  : key.mul_g;
+        const unsigned b =
+            metal ? metal->pixels[t * 4 + metal_channel] * key.mul_b / 255
+                  : key.mul_b;
+        out.pixels[t * 4 + 0] = 255;
+        out.pixels[t * 4 + 1] = static_cast<uint8_t>(g);
+        out.pixels[t * 4 + 2] = static_cast<uint8_t>(b);
+        out.pixels[t * 4 + 3] = 255;
+      }
+      return out;
+    }
+  }
+  return {};
+}
+
+// The mjModel texture whose declared colour space governs a staged image, or
+// -1 when the data must be read linearly regardless of what the texture says.
+int ColorSpaceSource(const ImageKey& key) {
+  switch (key.packing) {
+    case ImagePacking::Color:
+    case ImagePacking::BaseColor:
+      return key.primary;
+    case ImagePacking::Linear:
+    case ImagePacking::Orm:
+      return -1;
+  }
+  return -1;
+}
+
 // The complete glTF-PBR parameter set for one geom, as handed to
 // Pattern::Create.
 struct MaterialSpec {
@@ -483,19 +820,35 @@ struct MaterialSpec {
   // sets alpha_mode and the matching SemiTransparencyKind together.
   float alpha = 1.0f;
 
+  // glTFPbrPattern's texture slots, and the coordinate generation every one of
+  // them shares (it is a property of the geom, not of the role).
+  ImageKey base_color_map;
+  ImageKey metallic_roughness_map;
+  ImageKey normal_map;
+  ImageKey emissive_map;
+  TexGen texgen;
+
   // Quantized identity, so geoms whose materials would render identically
   // share one Pattern/Material. 1/4096 is far below any visible difference,
   // and an integer key hashes and orders exactly.
-  std::array<int32_t, 16> Key() const {
+  struct Key {
+    std::array<int32_t, 16> scalars{};
+    std::array<ImageKey, 4> maps{};
+    std::array<int32_t, 12> texgen{};
+    auto operator<=>(const Key&) const = default;
+  };
+
+  Key key() const {
     auto q = [](float v) {
       return static_cast<int32_t>(std::lround(v * 4096.0f));
     };
-    return {q(base_color[0]), q(base_color[1]), q(base_color[2]),
-            q(base_color[3]), q(specular[0]),   q(specular[1]),
-            q(specular[2]),   q(specular[3]),   q(emissive[0]),
-            q(emissive[1]),   q(emissive[2]),   q(emissive[3]),
-            q(metallic),      q(roughness),     q(ior),
-            q(alpha)};
+    return Key{
+        {q(base_color[0]), q(base_color[1]), q(base_color[2]), q(base_color[3]),
+         q(specular[0]), q(specular[1]), q(specular[2]), q(specular[3]),
+         q(emissive[0]), q(emissive[1]), q(emissive[2]), q(emissive[3]),
+         q(metallic), q(roughness), q(ior), q(alpha)},
+        {base_color_map, metallic_roughness_map, normal_map, emissive_map},
+        texgen.Key()};
   }
 };
 
@@ -543,6 +896,79 @@ MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
   // MuJoCo's emission is a scalar multiplier on the geom's own colour.
   spec.emissive = {emission * rgba[0], emission * rgba[1], emission * rgba[2],
                    0.0f};
+
+  if (matid < 0) return spec;
+
+  // Texture roles -> glTFPbrPattern slots. mat_texid is nmat x mjNTEXROLE.
+  //
+  //   RGB / RGBA           -> baseColorMap
+  //   OPACITY              -> folded into baseColorMap's alpha (no opacity slot)
+  //   ORM                  -> metallicRoughnessMap (glTF-native packing)
+  //   ROUGHNESS / METALLIC -> packed into a synthesized ORM image
+  //   NORMAL               -> normalMap
+  //   EMISSIVE             -> emissiveMap
+  //   OCCLUSION            -> dropped: the pattern has no occlusion input
+  //   USER                 -> ignored
+  const int* roles = m->mat_texid + matid * mjNTEXROLE;
+  auto usable = [&](int role) {
+    const int texid = roles[role];
+    // Encoded payloads are reported once per model in BuildScene, not here.
+    return (texid >= 0 && !IsEncodedTexture(m, texid)) ? texid : -1;
+  };
+
+  const int rgba_role = usable(mjTEXROLE_RGBA);
+  const int base = rgba_role >= 0 ? rgba_role : usable(mjTEXROLE_RGB);
+  if (base >= 0) {
+    spec.base_color_map = {ImagePacking::BaseColor, base,
+                           usable(mjTEXROLE_OPACITY)};
+  }
+
+  const int orm = usable(mjTEXROLE_ORM);
+  const int rough_tex = usable(mjTEXROLE_ROUGHNESS);
+  const int metal_tex = usable(mjTEXROLE_METALLIC);
+  if (orm >= 0 || rough_tex >= 0 || metal_tex >= 0) {
+    // A channel that has a texture takes the scalar as a glTF-style factor
+    // over it, which is 1 when the material leaves it unset; a channel with no
+    // texture takes the scalar outright, which is the same fallback the
+    // uniform-only path uses (Blinn-Phong roughness, non-metal).
+    const bool has_rough = orm >= 0 || rough_tex >= 0;
+    const bool has_metal = orm >= 0 || metal_tex >= 0;
+    const uint8_t mul_g =
+        has_rough ? ToByte(roughness >= 0.0f ? roughness : 1.0f)
+                  : ToByte(spec.roughness);
+    const uint8_t mul_b = has_metal
+                              ? ToByte(metallic >= 0.0f ? metallic : 1.0f)
+                              : ToByte(spec.metallic);
+    spec.metallic_roughness_map = {ImagePacking::Orm, orm,   rough_tex,
+                                   metal_tex,         mul_g, mul_b};
+    // The scalars now live entirely in the staged image, and the shader reads
+    // the map instead of the uniforms. Neutralize them so two materials that
+    // differ only in a scalar the map already carries still share a Pattern.
+    spec.metallic = 0.0f;
+    spec.roughness = 0.0f;
+  }
+
+  const int normal = usable(mjTEXROLE_NORMAL);
+  if (normal >= 0) spec.normal_map = {ImagePacking::Linear, normal};
+
+  const int emissive = usable(mjTEXROLE_EMISSIVE);
+  if (emissive >= 0) {
+    spec.emissive_map = {ImagePacking::Color, emissive};
+    // The emissive map multiplies the emissive uniform, so a material with a
+    // map but the default emission of 0 would be black. Use the geom colour at
+    // full strength in that case and let the map carry the variation.
+    if (emission <= 0.0f) {
+      spec.emissive = {rgba[0], rgba[1], rgba[2], 0.0f};
+    }
+  }
+
+  // Only give the spec a coordinate generation if something actually samples
+  // with it: texgen depends on the geom's own size, so letting it into the key
+  // for an untextured material would fragment the cache by geom size.
+  if (spec.base_color_map.bound() || spec.metallic_roughness_map.bound() ||
+      spec.normal_map.bound() || spec.emissive_map.bound()) {
+    spec.texgen = TexGenForGeom(m, i);
+  }
   return spec;
 }
 
@@ -671,16 +1097,26 @@ MeshBuild BuildPlaneGeometry(const mjModel* m, int geomid) {
     return n;
   };
   const int nx = subdiv(hx), ny = subdiv(hy);
+  // UVs follow the classic renderer's plane exactly (render_context.c:205-220):
+  // a finite dimension spans 0..1 across the plane, an infinite one is measured
+  // in world units so that the texrepeat scale is absolute; v runs opposite to
+  // +y in both cases.
+  auto plane_u = [&](float x) {
+    return size[0] > 0 ? (x + hx) / (2.0f * hx) : 0.5f * x;
+  };
+  auto plane_v = [&](float y) {
+    return size[1] > 0 ? 1.0f - (y + hy) / (2.0f * hy) : -0.5f * y;
+  };
   for (int ix = 0; ix < nx; ++ix) {
     const float x0 = -hx + 2.0f * hx * ix / nx;
     const float x1 = -hx + 2.0f * hx * (ix + 1) / nx;
-    const float u0 = static_cast<float>(ix) / nx;
-    const float u1 = static_cast<float>(ix + 1) / nx;
+    const float u0 = plane_u(x0);
+    const float u1 = plane_u(x1);
     for (int iy = 0; iy < ny; ++iy) {
       const float y0 = -hy + 2.0f * hy * iy / ny;
       const float y1 = -hy + 2.0f * hy * (iy + 1) / ny;
-      const float v0 = static_cast<float>(iy) / ny;
-      const float v1 = static_cast<float>(iy + 1) / ny;
+      const float v0 = plane_v(y0);
+      const float v1 = plane_v(y1);
       AppendQuad(mb, Eigen::Vector3f(x0, y0, 0.0f),
                  Eigen::Vector3f(x1, y0, 0.0f), Eigen::Vector3f(x1, y1, 0.0f),
                  Eigen::Vector3f(x0, y1, 0.0f), Eigen::Vector2f(u0, v0),
@@ -890,8 +1326,17 @@ struct BourbonContext::Impl {
   std::vector<Renderable> geoms;
   const bourbon::BXDFClass* pbr_bxdf = nullptr;
   const bourbon::PatternClass* pbr_pattern = nullptr;
-  std::map<std::array<int32_t, 16>, bourbon::RefPtr<bourbon::Material>>
+  std::map<MaterialSpec::Key, bourbon::RefPtr<bourbon::Material>>
       material_cache;
+  // Texture maps, keyed by the staged image plus the coordinate generation
+  // bound to it. The coord map is part of the TextureMap, not of the Pattern,
+  // so a texture sampled with two different texgens is uploaded twice; that is
+  // the price of not owning the DeviceImage ourselves (a TextureMap's image is
+  // a future resolved when its TaskHeap allocates, so it cannot be handed to a
+  // second TextureMap at build time).
+  std::map<std::pair<ImageKey, std::array<int32_t, 12>>,
+           bourbon::RefPtr<bourbon::TextureMap>>
+      texture_cache;
   // TriangleMesh shape caches, so geoms sharing a mesh/hfield share one Shape.
   std::map<int, bourbon::RefPtr<bourbon::Shape>> mesh_shape_cache;
   std::map<int, bourbon::RefPtr<bourbon::Shape>> hfield_shape_cache;
@@ -1071,12 +1516,132 @@ struct BourbonContext::Impl {
     }
     geoms.clear();
     material_cache.clear();
+    texture_cache.clear();
     mesh_shape_cache.clear();
     hfield_shape_cache.clear();
     pbr_bxdf = nullptr;
     pbr_pattern = nullptr;
     lights.clear();
     env_source_image.reset();
+  }
+
+  // Builds the coord map for a 2D texture under `tg`. All of them read the
+  // object-space hit position except Uv, which transforms the shape's own st.
+  bourbon::RefPtr<bourbon::TextureCoordMap2D> MakeCoordMap2D(const TexGen& tg) {
+    bourbon::TaskHeap& h = *model_heap;
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::SGContext& sg = *sg_context;
+    switch (tg.kind) {
+      case TexGen::Kind::Uv: {
+        // TransformUVCoordMap applies the matrix to (uv, 0, 1), and to the
+        // derivatives with w = 0, so a scale here keeps mip selection right.
+        Eigen::Matrix4f matrix = Eigen::Matrix4f::Identity();
+        matrix(0, 0) = tg.scale[0];
+        matrix(1, 1) = tg.scale[1];
+        matrix(0, 3) = tg.offset[0];
+        matrix(1, 3) = tg.offset[1];
+        return bourbon::TransformUVCoordMap::Create({.matrix = matrix}, h, g,
+                                                    sg);
+      }
+      case TexGen::Kind::Planar: {
+        // st = P.xy / size + 0.5, so flip y in the pre-transform to match the
+        // classic renderer's downward-running t (render_gl3.c:198-200).
+        Eigen::Matrix4f flip_y = Eigen::Matrix4f::Identity();
+        flip_y(1, 1) = -1.0f;
+        return bourbon::PlanarCoordMap::Create(
+            {.transform = flip_y,
+             .space = bourbon::Space::Object,
+             .size = tg.extent},
+            h, g, sg);
+      }
+      case TexGen::Kind::Spherical:
+        return bourbon::SphericalCoordMap::Create(
+            {.space = bourbon::Space::Object, .radius = tg.radius}, h, g, sg);
+      case TexGen::Kind::Cylindrical:
+        return bourbon::CylindricalCoordMap::Create(
+            {.space = bourbon::Space::Object, .height = tg.height}, h, g, sg);
+    }
+    return {};
+  }
+
+  // Builds the coord map for a cube texture: the object-space position, scaled
+  // by the geom's half-extents when mat_texuniform asks for it.
+  bourbon::RefPtr<bourbon::TextureCoordMap3D> MakeCoordMap3D(const TexGen& tg) {
+    Eigen::Matrix4f matrix = Eigen::Matrix4f::Identity();
+    matrix(0, 0) = tg.cube_scale[0];
+    matrix(1, 1) = tg.cube_scale[1];
+    matrix(2, 2) = tg.cube_scale[2];
+    return bourbon::TransformCoordMap3D::Create(
+        {.transform = matrix, .space = bourbon::Space::Object}, *model_heap,
+        *model_graph, *sg_context);
+  }
+
+  // Uploads (or reuses) the texture map for one glTFPbr slot. Returns null when
+  // the slot is unbound or the source pixels turned out to be unusable.
+  bourbon::RefPtr<bourbon::TextureMap> GetOrCreateTextureMap(
+      const mjModel* m, const ImageKey& key, const TexGen& tg) {
+    if (!key.bound()) return {};
+    const auto cache_key = std::make_pair(key, tg.Key());
+    auto it = texture_cache.find(cache_key);
+    if (it != texture_cache.end()) return it->second;
+
+    const TextureImage image = StageImage(m, key);
+    if (image.empty()) return {};
+
+    // Colour-carrying roles are decoded from sRGB by the sampler when the
+    // texture declares that colour space; ORM and normal data is always linear.
+    // This matches the classic renderer's internal-format choice
+    // (render_context.c:1486).
+    const int color_src = ColorSpaceSource(key);
+    const bool srgb = color_src >= 0 &&
+                      m->tex_colorspace[color_src] == mjCOLORSPACE_SRGB;
+    const MTL::PixelFormat format = srgb ? MTL::PixelFormatRGBA8Unorm_sRGB
+                                         : MTL::PixelFormatRGBA8Unorm;
+
+    // Repeat + trilinear, as the classic renderer uploads textures
+    // (render_context.c:1468-1471).
+    bourbon::TextureMap::Sampler<2> sampler;
+    sampler.min_filter = MTL::SamplerMinMagFilterLinear;
+    sampler.mag_filter = MTL::SamplerMinMagFilterLinear;
+    sampler.mip_filter = MTL::SamplerMipFilterLinear;
+    sampler.wrap = {MTL::SamplerAddressModeRepeat,
+                    MTL::SamplerAddressModeRepeat};
+    const unsigned mipmap_count = std::max(
+        1u, static_cast<unsigned>(std::log2(
+                std::min(image.width, image.height))));
+
+    bourbon::RefPtr<bourbon::TextureMap> texture_map;
+    if (image.cube) {
+      std::array<const void*, 6> faces{};
+      for (unsigned f = 0; f < 6; ++f) {
+        faces[f] = image.pixels.data() + f * image.face_bytes();
+      }
+      bourbon::CubeTextureMap::HostSource source;
+      source.format = format;
+      source.size = image.width;
+      source.pixels = faces;
+      source.mipmap_count = mipmap_count;
+      source.generate_mipmaps = true;
+      texture_map = bourbon::CubeTextureMap::Create(
+          {.source = source,
+           .sampler = sampler,
+           .coord_map = MakeCoordMap3D(tg)},
+          *model_heap, *model_graph, *sg_context);
+    } else {
+      bourbon::TextureMap2D::HostSource source;
+      source.format = format;
+      source.size = {image.width, image.height};
+      source.pixels = image.pixels.data();
+      source.mipmap_count = mipmap_count;
+      source.generate_mipmaps = true;
+      texture_map = bourbon::TextureMap2D::Create(
+          {.source = source,
+           .sampler = sampler,
+           .coord_map = MakeCoordMap2D(tg)},
+          *model_heap, *model_graph, *sg_context);
+    }
+    texture_cache[cache_key] = texture_map;
+    return texture_map;
   }
 
   // Returns the glTF-PBR material for `spec`, creating and caching one per
@@ -1087,8 +1652,8 @@ struct BourbonContext::Impl {
   // constructor memcpys into its argument block, so the pointed-to storage only
   // has to outlive this call.
   bourbon::RefPtr<bourbon::Material> GetOrCreateMaterial(
-      const MaterialSpec& spec) {
-    const std::array<int32_t, 16> key = spec.Key();
+      const mjModel* m, const MaterialSpec& spec) {
+    const MaterialSpec::Key key = spec.key();
     auto it = material_cache.find(key);
     if (it != material_cache.end()) return it->second;
 
@@ -1114,9 +1679,24 @@ struct BourbonContext::Impl {
         {Token::Get("sheen"), &sheen},
         {Token::Get("emissive"), &spec.emissive},
     };
+
+    // Texture bindings. A slot left out of the specs stays null in the
+    // pattern's TextureMaps struct, and glTFPbrPattern branches on exactly that
+    // to fall back to the uniform.
+    bourbon::TextureMapSet::Specs textures;
+    auto bind = [&](const char* slot, const ImageKey& image) {
+      if (auto map = GetOrCreateTextureMap(m, image, spec.texgen)) {
+        textures.push_back({Token::Get(slot), std::move(map)});
+      }
+    };
+    bind("baseColorMap", spec.base_color_map);
+    bind("metallicRoughnessMap", spec.metallic_roughness_map);
+    bind("normalMap", spec.normal_map);
+    bind("emissiveMap", spec.emissive_map);
+
     auto material = bourbon::Material::Create(
         pbr_bxdf,
-        bourbon::Pattern::Create(*pbr_pattern, params, {},
+        bourbon::Pattern::Create(*pbr_pattern, params, textures,
                                  bourbon::SemiTransparencyKind::Opaque,
                                  *model_heap, *model_graph, *sg_context),
         *model_heap, *model_graph, *sg_context);
@@ -1140,12 +1720,22 @@ struct BourbonContext::Impl {
     pbr_pattern =
         renderer_context->findPattern(bourbon::Token::Get("glTFPbrPattern"));
 
+    // Report unreadable textures once for the model rather than once per geom
+    // that references one; MaterialSpecForGeom then skips them silently.
+    for (int t = 0; t < m->ntex; ++t) {
+      if (IsEncodedTexture(m, t)) {
+        mju_warning("bourbon: texture %d is KTX/encoded (%d channels, %dx%d); "
+                    "only the Filament renderer decodes those, skipping it",
+                    t, m->tex_nchannel[t], m->tex_width[t], m->tex_height[t]);
+      }
+    }
+
     geoms.assign(m->ngeom, Renderable{});
     for (int i = 0; i < m->ngeom; ++i) {
       bourbon::RefPtr<bourbon::Shape> shape = MakeShapeForGeom(m, i);
       if (!shape) continue;
       bourbon::RefPtr<bourbon::Material> material =
-          GetOrCreateMaterial(MaterialSpecForGeom(m, i));
+          GetOrCreateMaterial(m, MaterialSpecForGeom(m, i));
       bourbon::SGNode* node = scene.createNode();
       scene.addRootNode(*node);
       auto xform = bourbon::MatrixTransformer::Create(g);
