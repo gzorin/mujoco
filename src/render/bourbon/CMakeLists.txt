@@ -98,6 +98,25 @@ set_target_properties(render_bourbon PROPERTIES
   CXX_VISIBILITY_PRESET default
   VISIBILITY_INLINES_HIDDEN OFF)
 
+# The visibility preset above is necessary but NOT sufficient once LTO is on.
+# MuJoCo enables ThinLTO for non-Debug builds (MUJOCO_ENABLE_LTO=ON), so this
+# library compiles to LLVM bitcode (-flto=thin). At the final executable link,
+# ThinLTO's whole-program pass sees the dgtype_tag<T> weak symbols referenced
+# only from within the executable (bourbon's dylibs carry their own copies) and
+# INTERNALIZES them -- they become non-external, so dyld can no longer coalesce
+# them with bourbon's dylib copies at load time. That gives them a different
+# address than bourbon's, and DGType::compatible() (which compares those tag
+# addresses across the DSO boundary) rejects every DG connection as a type
+# mismatch -- the same failure the visibility preset was meant to fix, resurfacing
+# at the LTO stage. A Debug build (LTO off) hides this bug.
+#
+# Disabling interprocedural optimization for THIS target keeps the boundary tag
+# symbols as real weak-external definitions in a regular object file, which LTO
+# then cannot internalize, so they coalesce with bourbon's at load. The rest of
+# MuJoCo keeps LTO. (Equivalent global escape hatch: -DMUJOCO_ENABLE_LTO=OFF.)
+set_target_properties(render_bourbon PROPERTIES
+  INTERPROCEDURAL_OPTIMIZATION OFF)
+
 target_link_libraries(render_bourbon
   PUBLIC
     mujoco::mujoco
