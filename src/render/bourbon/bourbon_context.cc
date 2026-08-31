@@ -998,12 +998,15 @@ struct Renderable {
   // material is bound at addShape and has no setter, so a swap is a
   // removeSGObject + addShape pair).
   bourbon::ShapeInstance* shape_instance = nullptr;
-  // A second ShapeInstance on the same node carrying the shared highlight
-  // material, added while this geom's body is selected and removed on deselect.
-  // Non-null iff the geom is currently highlighted. This is the proper way to
-  // show selection (one extra object, no material mutation, survives a material
-  // swap), not Filament's emission-compare hack.
-  bourbon::ShapeInstance* highlight_instance = nullptr;
+  // Whether this geom currently shows the selection glow. While true, its
+  // ShapeInstance holds a glow variant of its material (its own spec plus an
+  // emissive boost) instead of `material`, and the transparency sync leaves the
+  // instance alone. A translucent overlay would be the tidier design, but
+  // bourbon's OIT is LDR while the scene is HDR/photometric, so a blended
+  // overlay collapses to a dark smudge under the exposure -- an opaque emissive
+  // boost on the body's own material (as the classic renderer does) is the
+  // approach that actually reads.
+  bool highlighted = false;
 
   // Transparency state. A Pattern's SemiTransparencyKind is fixed at
   // construction (Pattern only exposes getSemiTransparency()), so a geom that
@@ -1353,11 +1356,11 @@ constexpr float kLineBoxThicknessFraction = 0.0015f;
 // extra_geoms append loop caps against it.
 constexpr int kDecorSceneMaxGeom = 10000;
 
-// Selection highlight: a warm additive glow blended over the selected body.
-// baseColor is black and the colour rides the emissive term (bourbon has no
-// unlit BXDF), at a modest alpha so the body still reads through the glow.
-constexpr float kHighlightColor[3] = {1.0f, 0.75f, 0.25f};
-constexpr float kHighlightAlpha = 0.45f;
+// Selection highlight: a warm emissive glow added (in nits) to the selected
+// body's own material, so the body keeps its shape/shading and just glows. An
+// opaque emissive boost, not a translucent overlay, because bourbon's OIT is LDR
+// under an HDR/photometric exposure (see the note on Renderable::highlighted).
+constexpr float kHighlightColor[3] = {1.0f, 0.6f, 0.15f};
 
 // Fills `out` with the part layout for decoration geom `geom` (sizes in the
 // mjvGeom convention: size[2] is the capsule/cylinder half-length, NOT size[1]
@@ -1623,11 +1626,10 @@ struct BourbonContext::Impl {
   float decor_emissive_nits = 0.0f;
   bourbon::RefPtr<bourbon::Shape> unit_triangle_shape;  // shared by all triangles
 
-  // Selection highlight: a shared unlit-glow material added as a second
-  // ShapeInstance on every geom of the selected body. `highlighted_body` is the
-  // body currently highlighted (-1 = none), so the set is only reworked when the
-  // selection actually changes.
-  bourbon::RefPtr<bourbon::Material> highlight_material;
+  // Selection highlight: every geom of the selected body has its ShapeInstance's
+  // material swapped for a glow variant (its own spec plus an emissive boost).
+  // `highlighted_body` is the body currently highlighted (-1 = none), so the set
+  // is only reworked when the selection actually changes.
   int highlighted_body = -1;
 
   // Retained lights: one per mjModel light (an mjLIGHT_IMAGE slot is left
@@ -1815,7 +1817,6 @@ struct BourbonContext::Impl {
     pbr_pattern = nullptr;
     lights.clear();
     env_source_image.reset();
-    highlight_material.reset();
     highlighted_body = -1;
     // Decoration pool: the nodes were just destroyed by destroyAllRootNodes, so
     // drop the (now dangling) slot bookkeeping and free the private scene, which
@@ -2035,42 +2036,6 @@ struct BourbonContext::Impl {
     // brightness under the camera's photometric exposure (a diffuse-white
     // surface fully lit by the reference light returns ~reference/pi nits).
     decor_emissive_nits = ReferenceIlluminance(m) / kPi;
-
-    // Shared selection-highlight material: a translucent warm glow, emissive so
-    // it is unaffected by lighting, blended so the selected body reads through.
-    {
-      const float nits = decor_emissive_nits;
-      const Eigen::Array4f base_color(0.0f, 0.0f, 0.0f, kHighlightAlpha);
-      const Eigen::Array4f emissive(kHighlightColor[0] * nits,
-                                    kHighlightColor[1] * nits,
-                                    kHighlightColor[2] * nits, 0.0f);
-      const Eigen::Array4f specular(0.0f, 0.0f, 0.0f, 0.0f);
-      const Eigen::Array4f sheen(0.0f, 0.0f, 0.0f, 0.0f);
-      const float metallic = 0.0f, roughness = 1.0f, ior = kDefaultIor;
-      const float alpha = kHighlightAlpha, transmission = 0.0f;
-      const float alpha_cutoff = 0.5f;
-      const int32_t alpha_mode = 2;  // BLEND
-      using bourbon::Token;
-      const bourbon::Pattern::Params params = {
-          {Token::Get("baseColor"), &base_color},
-          {Token::Get("metallic"), &metallic},
-          {Token::Get("roughness"), &roughness},
-          {Token::Get("transmission"), &transmission},
-          {Token::Get("specular"), &specular},
-          {Token::Get("ior"), &ior},
-          {Token::Get("alpha"), &alpha},
-          {Token::Get("alpha_mode"), &alpha_mode},
-          {Token::Get("alpha_cutoff"), &alpha_cutoff},
-          {Token::Get("sheen"), &sheen},
-          {Token::Get("emissive"), &emissive},
-      };
-      highlight_material = bourbon::Material::Create(
-          pbr_bxdf,
-          bourbon::Pattern::Create(*pbr_pattern, params, {},
-                                   bourbon::SemiTransparencyKind::Blend, h, g,
-                                   sg),
-          h, g, sg);
-    }
 
     // Report unreadable textures once for the model rather than once per geom
     // that references one; MaterialSpecForGeom then skips them silently.
@@ -2525,6 +2490,10 @@ struct BourbonContext::Impl {
     for (int i = 0; i < static_cast<int>(geoms.size()); ++i) {
       Renderable& r = geoms[i];
       if (!r.node) continue;
+      // A highlighted geom's instance holds the glow material; leave it. Its
+      // base material stays current for restoration on deselect (the common case
+      // has no alpha change while a body is held selected).
+      if (r.highlighted) continue;
       float alpha = r.spec.base_color[3];
       if (transparent && r.dynamic) alpha *= fade;
       const bool blend = alpha < 1.0f;
@@ -2576,6 +2545,21 @@ struct BourbonContext::Impl {
   // ShapeInstance carrying the shared glow material; deselecting removes them.
   // Only reworked when the selection changes (adding/removing instances mutates
   // shape morphology, so a change re-primes shadows). Returns true on a change.
+  // The glow variant of geom `i`'s material: its own parameter set with a warm
+  // emissive boost (in nits, so it survives the exposure), at the geom's current
+  // SemiTransparencyKind. Cached like any other material.
+  bourbon::RefPtr<bourbon::Material> HighlightMaterialFor(const mjModel* m,
+                                                          const Renderable& r) {
+    MaterialSpec spec = r.spec;
+    const float nits = decor_emissive_nits;
+    spec.emissive[0] += kHighlightColor[0] * nits;
+    spec.emissive[1] += kHighlightColor[1] * nits;
+    spec.emissive[2] += kHighlightColor[2] * nits;
+    return GetOrCreateMaterial(m, spec,
+                               r.blended ? bourbon::SemiTransparencyKind::Blend
+                                         : bourbon::SemiTransparencyKind::Opaque);
+  }
+
   bool UpdateSelection(const mjModel* m, int select) {
     const int body = select > 0 ? select : -1;
     if (body == highlighted_body) return false;
@@ -2585,14 +2569,19 @@ struct BourbonContext::Impl {
       Renderable& r = geoms[i];
       if (!r.node) continue;
       const bool want = body >= 0 && m->geom_bodyid[i] == body;
-      if (want && !r.highlight_instance) {
-        r.highlight_instance = r.node->addShape(
-            r.shape, highlight_material, *model_heap, *model_graph, *sg_context);
-        any_transparent = true;  // the glow is a Blend material; engage OIT
+      if (want && !r.highlighted) {
+        auto glow = HighlightMaterialFor(m, r);
+        r.node->removeSGObject(r.shape_instance);
+        r.shape_instance = r.node->addShape(r.shape, glow, *model_heap,
+                                            *model_graph, *sg_context);
+        r.highlighted = true;
         changed = true;
-      } else if (!want && r.highlight_instance) {
-        r.node->removeSGObject(r.highlight_instance);
-        r.highlight_instance = nullptr;
+      } else if (!want && r.highlighted) {
+        // Restore the geom's base material (kept current by UpdateTransparency).
+        r.node->removeSGObject(r.shape_instance);
+        r.shape_instance = r.node->addShape(r.shape, r.material, *model_heap,
+                                            *model_graph, *sg_context);
+        r.highlighted = false;
         changed = true;
       }
     }
@@ -2761,7 +2750,14 @@ struct BourbonContext::Impl {
     DecorPart part;
     part.kind = layout.kind;
     part.shape = CreateDecorShape(layout);
-    MakeDecorMaterial(part, rgba, rgba[3] < 1.0f);
+    // Decorations are always opaque: bourbon's OIT/Blend path is LDR and
+    // collapses to a dark smudge under the HDR photometric exposure (see the
+    // note on Renderable::highlighted / MLAB), so a translucent decoration would
+    // render near-black rather than semi-transparent. Opaque routes through the
+    // HDR emissive path and reads correctly; a decoration's authored alpha is
+    // dropped. (Flagged upstream: OIT should composite in the HDR/pre-exposure
+    // space.)
+    MakeDecorMaterial(part, rgba, /*blended=*/false);
     part.node = world->model().createNode();
     part.xform = bourbon::MatrixTransformer::Create(*model_graph);
     part.node->setTransformer(part.xform);
@@ -2770,7 +2766,6 @@ struct BourbonContext::Impl {
     world->model().addRootNode(*part.node);
     part.visible = true;
     ++decor_shape_count;
-    if (part.blended) any_transparent = true;
     primed = false;
     return part;
   }
@@ -2792,16 +2787,6 @@ struct BourbonContext::Impl {
   // pattern's live DGInputs, so an unchanged colour costs nothing and a changed
   // one is a setValue rather than a graph mutation.
   void UpdateDecorColor(DecorPart& part, const float rgba[4]) {
-    const bool need_blend = rgba[3] < 1.0f;
-    if (need_blend != part.blended) {
-      MakeDecorMaterial(part, rgba, need_blend);
-      part.node->removeSGObject(part.instance);
-      part.instance = part.node->addShape(part.shape, part.material,
-                                          *model_heap, *model_graph,
-                                          *sg_context);
-      if (need_blend) any_transparent = true;
-      primed = false;
-    }
     const std::array<int32_t, 4> key = {
         static_cast<int32_t>(std::lround(rgba[0] * 4096.0f)),
         static_cast<int32_t>(std::lround(rgba[1] * 4096.0f)),
