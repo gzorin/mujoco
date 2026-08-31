@@ -54,9 +54,16 @@ class BourbonContext {
   // (mjRND_SHADOW) toggles shadow casting; enabling it switches the pass graph
   // onto a non-Direct submission mode. `vis_option` may be null; mjVIS_TRANSPARENT
   // is read from it to fade dynamic geoms.
-  void RenderFrame(const mjModel* model, mjData* data, mjvCamera* camera,
+  //
+  // `perturb` and `extra_geoms` drive the pooled decorations: a private mjvScene
+  // is updated with mjCAT_ALL, `extra_geoms` are appended as mjCAT_DECOR, and
+  // every decoration geom is realized through a grow-to-high-water node pool (no
+  // per-frame node create/destroy). `perturb` and `extra_geoms` may be null/empty.
+  void RenderFrame(const mjModel* model, mjData* data,
+                   const mjvPerturb* perturb, mjvCamera* camera,
                    const mjvOption* vis_option, int width, int height,
-                   bool shadow_enabled);
+                   bool shadow_enabled, const mjvGeom* extra_geoms,
+                   int num_extra_geoms);
 
   // Frames-per-second, exponentially smoothed.
   double GetFps() const;

@@ -369,6 +369,18 @@ Eigen::Affine3f GeomAffine(const mjtNum* pos, const mjtNum* xmat) {
   return a;
 }
 
+// Builds a rigid object->world transform from a float position (3) and a
+// row-major 3x3 orientation, as carried by mjvGeom (pos/mat are float, and mat
+// is row-major just like mjData::geom_xmat). Used for decorations.
+Eigen::Affine3f GeomAffineF(const float* pos, const float* mat) {
+  Eigen::Matrix3f r;
+  r << mat[0], mat[1], mat[2], mat[3], mat[4], mat[5], mat[6], mat[7], mat[8];
+  Eigen::Affine3f a = Eigen::Affine3f::Identity();
+  a.linear() = r;
+  a.translation() = Eigen::Vector3f(pos[0], pos[1], pos[2]);
+  return a;
+}
+
 // Any unit vector orthogonal to `v` (a port of mjr_orthoVec): cross with an
 // axis that is not parallel to `v`. Used to complete a light's orientation
 // frame, whose roll about its own axis is irrelevant for shading.
@@ -1269,7 +1281,209 @@ MeshBuild BuildHfieldGeometry(const mjModel* m, int hid) {
   return mb;
 }
 
+// --- Decorations -------------------------------------------------------------
+//
+// MuJoCo decorations (contact points/forces, joints, COM markers, perturb
+// ghosts, plugin geoms, ...) arrive each frame through a private mjvScene, not
+// through mjData. They are inherently dynamic -- an arrow's length tracks a
+// contact force -- so the retained-mode win here is different from the model
+// geoms': rather than skip unchanged transforms, we keep a grow-to-high-water
+// pool of nodes that is never torn down, and drive each one's size, transform
+// and colour through DGInputs. Because every SDF kind now recomputes its march
+// bounds from its live DGInputs each evaluation (SDF3D.cpp), a primitive can be
+// resized every frame with neither a Shape rebuild nor a clipped surface, and a
+// per-part Pattern lets the colour be re-pushed without a graph mutation. So the
+// steady state (a stable set of decorations) is pure setValueIfChanged.
+//
+// Composites (arrows) are several SDF parts under one geom frame; each part is
+// its own root node with a rigid local offset baked into its world transform
+// (SDF nodes must stay rigid -- R2 -- so the head cone's widening is baked into
+// its radii, never a node scale). Triangles are the one rasterized decoration,
+// so they may use a node scale.
+
+// Which concrete bourbon shape backs a decoration part. The tag lets the pool
+// downcast the RefPtr<Shape> to push size DGInputs for a live resize.
+enum class DecorShapeKind { RoundCone, Frustum, Cube, Ellipsoid, BoxFrame,
+                            Triangle, Mesh };
+
+// One part of a decoration geom: a shape, its rigid (or, for a triangle,
+// scaling) offset within the geom frame, and the size parameters to push into
+// the shape's DGInputs. Interpretation of the size fields is by `kind`:
+//   RoundCone : radius, height              (sphere: height 0; capsule)
+//   Frustum   : base_radius, top_radius, base_z, top_z   (cylinder/shaft/cone/line)
+//   Cube      : ex, ey, ez                  (full extents)
+//   Ellipsoid : ex, ey, ez                  (radii)
+//   BoxFrame  : ex, ey, ez, thickness       (full extents + edge-bar thickness)
+//   Triangle  : `local` carries the size as a scale; no DGInputs
+//   Mesh      : `mesh_dataid` selects a cached mesh shape; no DGInputs
+struct DecorPartLayout {
+  DecorShapeKind kind = DecorShapeKind::RoundCone;
+  Eigen::Affine3f local = Eigen::Affine3f::Identity();
+  float base_radius = 0, top_radius = 0, base_z = 0, top_z = 0;  // Frustum
+  float radius = 0, height = 0;                                   // RoundCone
+  float ex = 0, ey = 0, ez = 0;                                   // Cube/Ellipsoid/BoxFrame
+  float thickness = 0;                                            // BoxFrame
+  int mesh_dataid = -1;                                           // Mesh
+};
+
+// Arrow proportions, matching the classic renderer's builtin display lists
+// (render_gl3.c:421-448 with the cone/cylinder extents from render_context.c:
+// cone spans z in [0,1] base radius 1, cylinder spans z in [-1,1] radius 1). An
+// arrow's size is {shaft_radius, shaft_radius, length}; the shaft runs to
+// length/3 and the head from there to length/2, with the wedged head widened by
+// kArrowHeadScale.
+constexpr float kArrowHeadScale = 1.75f;
+
+// A LINE decoration is a thin cylinder. Its width (mjvGeom.size[0]) is authored
+// in screen pixels for the classic GL_LINES path, which has no object-space
+// meaning here; use a small fraction of the scene extent so a line reads as a
+// hairline at typical zoom. Tunable.
+constexpr float kLineRadiusFraction = 0.0015f;
+// LINEBOX edge-bar thickness, likewise a fraction of the scene extent.
+constexpr float kLineBoxThicknessFraction = 0.0015f;
+
+// Upper bound on the private decoration mjvScene. Contacts and force arrows can
+// be numerous; this is generous enough for typical studio scenes, and the
+// extra_geoms append loop caps against it.
+constexpr int kDecorSceneMaxGeom = 10000;
+
+// Fills `out` with the part layout for decoration geom `geom` (sizes in the
+// mjvGeom convention: size[2] is the capsule/cylinder half-length, NOT size[1]
+// -- see engine_vis_visualize.c:327 and the plan's R4). `scene_extent` scales
+// the screen-referred line widths. Returns false for a geom type this pool does
+// not render (label/flex/skin/plane/hfield/sdf/none), which the caller skips.
+bool LayoutDecoration(const mjvGeom& geom, float scene_extent,
+                      std::vector<DecorPartLayout>& out) {
+  out.clear();
+  const float s0 = geom.size[0], s1 = geom.size[1], s2 = geom.size[2];
+  auto frustum = [](float br, float tr, float bz, float tz) {
+    DecorPartLayout p;
+    p.kind = DecorShapeKind::Frustum;
+    p.base_radius = br;
+    p.top_radius = tr;
+    p.base_z = bz;
+    p.top_z = tz;
+    return p;
+  };
+  switch (geom.type) {
+    case mjGEOM_SPHERE: {
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::RoundCone;
+      p.radius = s0;
+      p.height = 0.0f;
+      out.push_back(p);
+    } break;
+    case mjGEOM_CAPSULE: {
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::RoundCone;
+      p.radius = s0;
+      p.height = 2.0f * s2;  // centre-to-centre of the end caps
+      out.push_back(p);
+    } break;
+    case mjGEOM_CYLINDER:
+      out.push_back(frustum(s0, s0, -s2, s2));
+      break;
+    case mjGEOM_BOX: {
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::Cube;
+      p.ex = 2.0f * s0;
+      p.ey = 2.0f * s1;
+      p.ez = 2.0f * s2;
+      out.push_back(p);
+    } break;
+    case mjGEOM_ELLIPSOID: {
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::Ellipsoid;
+      p.ex = s0;
+      p.ey = s1;
+      p.ez = s2;
+      out.push_back(p);
+    } break;
+    case mjGEOM_MESH:
+    case mjGEOM_SDF: {
+      if (geom.dataid < 0) return false;
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::Mesh;
+      p.mesh_dataid = geom.dataid / 2;  // 2*id shaded / 2*id+1 hull share verts
+      out.push_back(p);
+    } break;
+    case mjGEOM_ARROW:
+      out.push_back(frustum(s0, s0, 0.0f, s2 / 3.0f));
+      out.push_back(
+          frustum(kArrowHeadScale * s0, 0.0f, s2 / 3.0f, s2 / 2.0f));
+      break;
+    case mjGEOM_ARROW1:
+      out.push_back(frustum(s0, s0, 0.0f, s2 / 3.0f));
+      out.push_back(frustum(s0, 0.0f, s2 / 3.0f, s2 / 2.0f));
+      break;
+    case mjGEOM_ARROW2:
+      out.push_back(frustum(s0, s0, -s2 / 3.0f, s2 / 3.0f));
+      out.push_back(
+          frustum(kArrowHeadScale * s0, 0.0f, s2 / 3.0f, s2 / 2.0f));
+      // The -z head is a cone whose apex (radius 0) is the more negative z.
+      out.push_back(
+          frustum(0.0f, kArrowHeadScale * s0, -s2 / 2.0f, -s2 / 3.0f));
+      break;
+    case mjGEOM_LINE: {
+      const float r = std::max(kLineRadiusFraction * scene_extent, 1e-5f);
+      out.push_back(frustum(r, r, 0.0f, s2));
+    } break;
+    case mjGEOM_LINEBOX: {
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::BoxFrame;
+      p.ex = 2.0f * s0;
+      p.ey = 2.0f * s1;
+      p.ez = 2.0f * s2;
+      p.thickness = std::max(kLineBoxThicknessFraction * scene_extent, 1e-5f);
+      out.push_back(p);
+    } break;
+    case mjGEOM_TRIANGLE: {
+      DecorPartLayout p;
+      p.kind = DecorShapeKind::Triangle;
+      // A unit triangle (0,0,0)-(1,0,0)-(0,1,0) scaled to the geom's size; a
+      // TriangleMesh is rasterized, so a node scale is safe here.
+      Eigen::Matrix3f scale = Eigen::Matrix3f::Zero();
+      scale(0, 0) = s0 > 0 ? s0 : 1.0f;
+      scale(1, 1) = s1 > 0 ? s1 : 1.0f;
+      scale(2, 2) = 1.0f;
+      p.local = Eigen::Affine3f::Identity();
+      p.local.linear() = scale;
+      out.push_back(p);
+    } break;
+    default:
+      return false;  // plane/hfield/flex/skin/label/none: not this pool
+  }
+  return true;
+}
+
 }  // namespace
+
+// One realized decoration part: a root node with a rigid (or, for a triangle,
+// scaling) transform, a shape whose size is pushed through DGInputs, and a
+// dedicated unlit Pattern/Material whose emissive colour is re-pushed live. The
+// Pattern is owned per-part precisely so the colour update is a setValue rather
+// than a material swap (which would mutate the graph and re-dirty morphology).
+struct DecorPart {
+  bourbon::SGNode* node = nullptr;  // owned by world->model()
+  bourbon::RefPtr<bourbon::MatrixTransformer> xform;
+  bourbon::RefPtr<bourbon::Shape> shape;
+  bourbon::RefPtr<bourbon::Pattern> pattern;
+  bourbon::RefPtr<bourbon::Material> material;
+  bourbon::ShapeInstance* instance = nullptr;
+  DecorShapeKind kind = DecorShapeKind::RoundCone;
+  bool visible = false;
+  bool blended = false;
+  // Last colour pushed into the pattern, so an unchanged colour is not
+  // re-pushed (which would re-dirty the pattern's arguments every frame).
+  std::array<int32_t, 4> rgba_key = {-1, -1, -1, -1};
+};
+
+// A decoration slot holds all the parts of one decoration geom. Slots are
+// pooled by ordinal (the i-th decoration geom of the frame reuses slot i); the
+// pool only ever grows, and unused parts/slots are hidden, never destroyed.
+struct DecorSlot {
+  std::vector<DecorPart> parts;
+};
 
 struct BourbonContext::Impl {
   // Metal objects. The device is owned by the CAMetalLayer (SDL created it); we
@@ -1380,6 +1594,23 @@ struct BourbonContext::Impl {
   // TriangleMesh shape caches, so geoms sharing a mesh/hfield share one Shape.
   std::map<int, bourbon::RefPtr<bourbon::Shape>> mesh_shape_cache;
   std::map<int, bourbon::RefPtr<bourbon::Shape>> hfield_shape_cache;
+
+  // --- Decorations. A private mjvScene is updated every frame (mjCAT_ALL),
+  // extra_geoms appended as mjCAT_DECOR, and each decoration geom realized
+  // through the grow-to-high-water `decor_slots` pool. `decor_scene_made` tracks
+  // whether `decor_scene` has been mjv_makeScene'd for the current model.
+  // `decor_shape_count` is the number of decoration ShapeInstances ever created
+  // (they persist, hidden, so a nonzero count means the world holds shapes even
+  // when no model geom does -- see HasShapes). `decor_emissive_nits` scales a
+  // decoration's [0,1] colour to a radiance that reads at full brightness under
+  // the camera's photometric exposure (decorations are unlit overlays).
+  mjvScene decor_scene = {};
+  bool decor_scene_made = false;
+  std::vector<DecorSlot> decor_slots;
+  int decor_shape_count = 0;
+  float decor_emissive_nits = 0.0f;
+  bourbon::RefPtr<bourbon::Shape> unit_triangle_shape;  // shared by all triangles
+
   // Retained lights: one per mjModel light (an mjLIGHT_IMAGE slot is left
   // source-less -- its texture drives the environment light instead), then the
   // headlight, then at most one environment light. Only the first nlight
@@ -1565,6 +1796,16 @@ struct BourbonContext::Impl {
     pbr_pattern = nullptr;
     lights.clear();
     env_source_image.reset();
+    // Decoration pool: the nodes were just destroyed by destroyAllRootNodes, so
+    // drop the (now dangling) slot bookkeeping and free the private scene, which
+    // is model-specific and remade on the next Init.
+    decor_slots.clear();
+    decor_shape_count = 0;
+    unit_triangle_shape.reset();
+    if (decor_scene_made) {
+      mjv_freeScene(&decor_scene);
+      decor_scene_made = false;
+    }
   }
 
   // Builds the coord map for a 2D texture under `tg`. All of them read the
@@ -1768,6 +2009,12 @@ struct BourbonContext::Impl {
     pbr_pattern =
         renderer_context->findPattern(bourbon::Token::Get("glTFPbrPattern"));
 
+    // Decorations are unlit: their [0,1] colour is emitted as radiance. Scale it
+    // to the scene's reference illuminance / pi so an overlay reads at full
+    // brightness under the camera's photometric exposure (a diffuse-white
+    // surface fully lit by the reference light returns ~reference/pi nits).
+    decor_emissive_nits = ReferenceIlluminance(m) / kPi;
+
     // Report unreadable textures once for the model rather than once per geom
     // that references one; MaterialSpecForGeom then skips them silently.
     for (int t = 0; t < m->ntex; ++t) {
@@ -1814,6 +2061,7 @@ struct BourbonContext::Impl {
   // dereferences a null (zero-count) shape-index buffer and asserts if the world
   // has no shapes, so callers must not evaluate the render graph in that case.
   bool HasShapes() const {
+    if (decor_shape_count > 0) return true;  // pooled decor parts persist hidden
     for (const auto& r : geoms) {
       if (r.node) return true;
     }
@@ -2265,6 +2513,325 @@ struct BourbonContext::Impl {
     }
     return any;
   }
+
+  // --- Decoration pool -------------------------------------------------------
+
+  // Creates the concrete bourbon shape for one decoration part, sized from the
+  // layout. Sizes are baked in at construction (and re-pushed each frame by
+  // ApplyDecorSize); node transforms stay rigid, so the size lives entirely in
+  // the shape's own DGInputs (R2). Triangles reuse one shared unit-triangle
+  // mesh; meshes reuse the model's per-dataid mesh cache.
+  bourbon::RefPtr<bourbon::Shape> CreateDecorShape(const DecorPartLayout& p) {
+    bourbon::TaskHeap& h = *model_heap;
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::SGContext& sg = *sg_context;
+    switch (p.kind) {
+      case DecorShapeKind::RoundCone:
+        // CapsuleParams -> RoundConeSDF; a height of 0 is a sphere.
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::CapsuleParams{.radius = std::max(p.radius, 1e-5f),
+                                          .height = p.height},
+            h, g, sg);
+      case DecorShapeKind::Frustum:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::FrustumParams{.base_radius = p.base_radius,
+                                          .top_radius = p.top_radius,
+                                          .base_z = p.base_z,
+                                          .top_z = p.top_z},
+            h, g, sg);
+      case DecorShapeKind::Cube:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::CubeParams{.width = std::max(p.ex, 1e-5f),
+                                       .height = std::max(p.ey, 1e-5f),
+                                       .depth = std::max(p.ez, 1e-5f)},
+            h, g, sg);
+      case DecorShapeKind::Ellipsoid:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::EllipsoidParams{.radius_x = std::max(p.ex, 1e-5f),
+                                            .radius_y = std::max(p.ey, 1e-5f),
+                                            .radius_z = std::max(p.ez, 1e-5f)},
+            h, g, sg);
+      case DecorShapeKind::BoxFrame:
+        return bourbon::SDF3D::Create(
+            bourbon::SDF3D::BoxFrameParams{.width = std::max(p.ex, 1e-5f),
+                                           .height = std::max(p.ey, 1e-5f),
+                                           .depth = std::max(p.ez, 1e-5f),
+                                           .thickness = p.thickness},
+            h, g, sg);
+      case DecorShapeKind::Triangle: {
+        if (!unit_triangle_shape) {
+          MeshBuild mb;
+          mb.has_st = true;
+          AppendTri(mb, Eigen::Vector3f(0, 0, 0), Eigen::Vector3f(1, 0, 0),
+                    Eigen::Vector3f(0, 1, 0), Eigen::Vector2f(0, 1),
+                    Eigen::Vector2f(1, 1), Eigen::Vector2f(0, 0));
+          unit_triangle_shape = CreateTriangleMeshShape(mb);
+        }
+        return unit_triangle_shape;
+      }
+      case DecorShapeKind::Mesh: {
+        if (p.mesh_dataid < 0) return {};
+        auto it = mesh_shape_cache.find(p.mesh_dataid);
+        if (it != mesh_shape_cache.end()) return it->second;
+        auto shape =
+            CreateTriangleMeshShape(BuildMeshGeometry(model, p.mesh_dataid));
+        mesh_shape_cache[p.mesh_dataid] = shape;
+        return shape;
+      }
+    }
+    return {};
+  }
+
+  // Pushes a decoration part's live size into its shape's DGInputs. A no-op for
+  // triangles/meshes (their size is carried by the node scale / baked verts).
+  void ApplyDecorSize(DecorPart& part, const DecorPartLayout& p) {
+    switch (p.kind) {
+      case DecorShapeKind::RoundCone: {
+        auto* s = static_cast<bourbon::RoundConeSDF*>(part.shape.get());
+        const float r = std::max(p.radius, 1e-5f);
+        s->base_radius().setValueIfChanged(r);
+        s->top_radius().setValueIfChanged(r);
+        s->height().setValueIfChanged(p.height);
+      } break;
+      case DecorShapeKind::Frustum: {
+        auto* s = static_cast<bourbon::FrustumSDF*>(part.shape.get());
+        s->base_radius().setValueIfChanged(p.base_radius);
+        s->top_radius().setValueIfChanged(p.top_radius);
+        s->base_z().setValueIfChanged(p.base_z);
+        s->top_z().setValueIfChanged(p.top_z);
+      } break;
+      case DecorShapeKind::Cube: {
+        auto* s = static_cast<bourbon::CubeSDF*>(part.shape.get());
+        s->width().setValueIfChanged(std::max(p.ex, 1e-5f));
+        s->height().setValueIfChanged(std::max(p.ey, 1e-5f));
+        s->depth().setValueIfChanged(std::max(p.ez, 1e-5f));
+      } break;
+      case DecorShapeKind::Ellipsoid: {
+        auto* s = static_cast<bourbon::EllipsoidSDF*>(part.shape.get());
+        s->radius_x().setValueIfChanged(std::max(p.ex, 1e-5f));
+        s->radius_y().setValueIfChanged(std::max(p.ey, 1e-5f));
+        s->radius_z().setValueIfChanged(std::max(p.ez, 1e-5f));
+      } break;
+      case DecorShapeKind::BoxFrame: {
+        auto* s = static_cast<bourbon::BoxFrameSDF*>(part.shape.get());
+        s->width().setValueIfChanged(std::max(p.ex, 1e-5f));
+        s->height().setValueIfChanged(std::max(p.ey, 1e-5f));
+        s->depth().setValueIfChanged(std::max(p.ez, 1e-5f));
+        s->thickness().setValueIfChanged(p.thickness);
+      } break;
+      case DecorShapeKind::Triangle:
+      case DecorShapeKind::Mesh:
+        break;
+    }
+  }
+
+  // Builds the unlit Pattern + Material for a decoration of colour `rgba`.
+  // Decorations are UX overlays, so they are shaded flat: baseColor is black and
+  // the colour is carried entirely by the emissive term, scaled to a radiance
+  // (decor_emissive_nits) that survives the camera's photometric exposure.
+  // bourbon has no unlit BXDF, so this is the glTF-PBR emissive path standing in
+  // for one. A translucent decoration (alpha < 1) is a Blend material.
+  void MakeDecorMaterial(DecorPart& part, const float rgba[4], bool blended) {
+    const float nits = decor_emissive_nits;
+    const Eigen::Array4f base_color(0.0f, 0.0f, 0.0f, rgba[3]);
+    const Eigen::Array4f emissive(rgba[0] * nits, rgba[1] * nits,
+                                  rgba[2] * nits, 0.0f);
+    const Eigen::Array4f specular(0.0f, 0.0f, 0.0f, 0.0f);  // weight 0: unlit
+    const Eigen::Array4f sheen(0.0f, 0.0f, 0.0f, 0.0f);
+    const float metallic = 0.0f, roughness = 1.0f, ior = kDefaultIor;
+    const float alpha = rgba[3], transmission = 0.0f, alpha_cutoff = 0.5f;
+    const int32_t alpha_mode = blended ? 2 : 0;
+
+    using bourbon::Token;
+    const bourbon::Pattern::Params params = {
+        {Token::Get("baseColor"), &base_color},
+        {Token::Get("metallic"), &metallic},
+        {Token::Get("roughness"), &roughness},
+        {Token::Get("transmission"), &transmission},
+        {Token::Get("specular"), &specular},
+        {Token::Get("ior"), &ior},
+        {Token::Get("alpha"), &alpha},
+        {Token::Get("alpha_mode"), &alpha_mode},
+        {Token::Get("alpha_cutoff"), &alpha_cutoff},
+        {Token::Get("sheen"), &sheen},
+        {Token::Get("emissive"), &emissive},
+    };
+    const bourbon::SemiTransparencyKind kind =
+        blended ? bourbon::SemiTransparencyKind::Blend
+                : bourbon::SemiTransparencyKind::Opaque;
+    part.pattern = bourbon::Pattern::Create(*pbr_pattern, params, {}, kind,
+                                            *model_heap, *model_graph,
+                                            *sg_context);
+    part.material = bourbon::Material::Create(pbr_bxdf, part.pattern,
+                                              *model_heap, *model_graph,
+                                              *sg_context);
+    part.blended = blended;
+    part.rgba_key = {-1, -1, -1, -1};  // force the first colour push
+  }
+
+  // Creates a fresh decoration part (node + rigid transform + shape + unlit
+  // material). New shape kinds re-dirty shape morphology, so re-prime shadows.
+  DecorPart CreateDecorPart(const DecorPartLayout& layout, const float rgba[4]) {
+    DecorPart part;
+    part.kind = layout.kind;
+    part.shape = CreateDecorShape(layout);
+    MakeDecorMaterial(part, rgba, rgba[3] < 1.0f);
+    part.node = world->model().createNode();
+    part.xform = bourbon::MatrixTransformer::Create(*model_graph);
+    part.node->setTransformer(part.xform);
+    part.instance = part.node->addShape(part.shape, part.material, *model_heap,
+                                        *model_graph, *sg_context);
+    world->model().addRootNode(*part.node);
+    part.visible = true;
+    ++decor_shape_count;
+    if (part.blended) any_transparent = true;
+    primed = false;
+    return part;
+  }
+
+  // Repurposes an existing part's node for a different shape kind: swap the
+  // shape in place (the node, transform and material are kept). Mutates shape
+  // morphology, so re-prime shadows.
+  void RebuildDecorPartShape(DecorPart& part, const DecorPartLayout& layout) {
+    part.shape = CreateDecorShape(layout);
+    part.node->removeSGObject(part.instance);
+    part.instance = part.node->addShape(part.shape, part.material, *model_heap,
+                                        *model_graph, *sg_context);
+    part.kind = layout.kind;
+    primed = false;
+  }
+
+  // Pushes a decoration part's colour (and, if the alpha crossed the opacity
+  // boundary, a rebuilt Blend/Opaque material). The colour goes through the
+  // pattern's live DGInputs, so an unchanged colour costs nothing and a changed
+  // one is a setValue rather than a graph mutation.
+  void UpdateDecorColor(DecorPart& part, const float rgba[4]) {
+    const bool need_blend = rgba[3] < 1.0f;
+    if (need_blend != part.blended) {
+      MakeDecorMaterial(part, rgba, need_blend);
+      part.node->removeSGObject(part.instance);
+      part.instance = part.node->addShape(part.shape, part.material,
+                                          *model_heap, *model_graph,
+                                          *sg_context);
+      if (need_blend) any_transparent = true;
+      primed = false;
+    }
+    const std::array<int32_t, 4> key = {
+        static_cast<int32_t>(std::lround(rgba[0] * 4096.0f)),
+        static_cast<int32_t>(std::lround(rgba[1] * 4096.0f)),
+        static_cast<int32_t>(std::lround(rgba[2] * 4096.0f)),
+        static_cast<int32_t>(std::lround(rgba[3] * 4096.0f))};
+    if (key == part.rgba_key) return;
+    part.rgba_key = key;
+    const float nits = decor_emissive_nits;
+    const Eigen::Array4f emissive(rgba[0] * nits, rgba[1] * nits,
+                                  rgba[2] * nits, 0.0f);
+    const Eigen::Array4f base_color(0.0f, 0.0f, 0.0f, rgba[3]);
+    const float alpha = rgba[3];
+    using bourbon::Token;
+    if (auto* e = part.pattern->findParam(Token::Get("emissive"))) {
+      e->setValue(&emissive);
+    }
+    if (auto* b = part.pattern->findParam(Token::Get("baseColor"))) {
+      b->setValue(&base_color);
+    }
+    if (auto* a = part.pattern->findParam(Token::Get("alpha"))) {
+      a->setValue(&alpha);
+    }
+  }
+
+  void HideDecorPart(DecorPart& part) {
+    if (part.visible) {
+      part.node->setVisibility(false);
+      part.visible = false;
+    }
+  }
+
+  void HideDecorSlot(DecorSlot& slot) {
+    for (DecorPart& part : slot.parts) HideDecorPart(part);
+  }
+
+  void HideAllDecorations() {
+    for (DecorSlot& slot : decor_slots) HideDecorSlot(slot);
+  }
+
+  // Realizes decoration geom `geom` into pool slot `slot_index`, creating parts
+  // as the high-water mark grows and hiding any surplus tail.
+  void RealizeDecoration(int slot_index, const mjvGeom& geom,
+                         const std::vector<DecorPartLayout>& layout) {
+    if (slot_index >= static_cast<int>(decor_slots.size())) {
+      decor_slots.resize(slot_index + 1);
+    }
+    DecorSlot& slot = decor_slots[slot_index];
+    const Eigen::Affine3f world_xf = GeomAffineF(geom.pos, geom.mat);
+    for (int p = 0; p < static_cast<int>(layout.size()); ++p) {
+      if (p >= static_cast<int>(slot.parts.size())) {
+        slot.parts.push_back(CreateDecorPart(layout[p], geom.rgba));
+      }
+      DecorPart& part = slot.parts[p];
+      if (part.kind != layout[p].kind) RebuildDecorPartShape(part, layout[p]);
+      ApplyDecorSize(part, layout[p]);
+      part.xform->local_matrix().setValueIfChanged(world_xf * layout[p].local);
+      UpdateDecorColor(part, geom.rgba);
+      if (!part.visible) {
+        part.node->setVisibility(true);
+        part.visible = true;
+      }
+    }
+    for (int p = static_cast<int>(layout.size());
+         p < static_cast<int>(slot.parts.size()); ++p) {
+      HideDecorPart(slot.parts[p]);
+    }
+  }
+
+  // Updates every decoration from the private mjvScene. Runs mjv_updateScene
+  // (mjCAT_ALL, the only way the mjvGeom API exposes decor), appends the
+  // caller's extra_geoms as mjCAT_DECOR, then drives the node pool. Flex/skin
+  // (mjGEOM_FLEX) is deferred to a later increment and skipped here.
+  void UpdateDecorations(const mjModel* m, mjData* d,
+                         const mjvPerturb* perturb, mjvCamera* cam,
+                         const mjvOption* opt, const mjvGeom* extra,
+                         int num_extra) {
+    if (!m || !d || !cam) {
+      HideAllDecorations();
+      return;
+    }
+    if (!decor_scene_made) {
+      mjv_makeScene(m, &decor_scene, kDecorSceneMaxGeom);
+      decor_scene_made = true;
+    }
+    mjvOption default_opt;
+    if (!opt) {
+      mjv_defaultOption(&default_opt);
+      opt = &default_opt;
+    }
+    mjvPerturb default_perturb;
+    if (!perturb) {
+      mjv_defaultPerturb(&default_perturb);
+      perturb = &default_perturb;
+    }
+    mjv_updateScene(m, d, opt, perturb, cam, mjCAT_ALL, &decor_scene);
+    const int room = decor_scene.maxgeom - decor_scene.ngeom;
+    const int add = std::min(num_extra, std::max(room, 0));
+    for (int i = 0; i < add; ++i) {
+      decor_scene.geoms[decor_scene.ngeom] = extra[i];
+      decor_scene.geoms[decor_scene.ngeom].category = mjCAT_DECOR;
+      ++decor_scene.ngeom;
+    }
+
+    const float extent = std::max(static_cast<float>(m->stat.extent), 1e-3f);
+    std::vector<DecorPartLayout> layout;
+    int used = 0;
+    for (int i = 0; i < decor_scene.ngeom; ++i) {
+      const mjvGeom& geom = decor_scene.geoms[i];
+      if (geom.category != mjCAT_DECOR) continue;  // flex/skin: later increment
+      if (!LayoutDecoration(geom, extent, layout)) continue;
+      RealizeDecoration(used++, geom, layout);
+    }
+    for (int s = used; s < static_cast<int>(decor_slots.size()); ++s) {
+      HideDecorSlot(decor_slots[s]);
+    }
+  }
 };
 
 BourbonContext::BourbonContext(void* metal_layer)
@@ -2387,9 +2954,10 @@ void BourbonContext::SetClearColor(float r, float g, float b, float a) {
 }
 
 void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
-                                 mjvCamera* mj_camera,
+                                 const mjvPerturb* perturb, mjvCamera* mj_camera,
                                  const mjvOption* vis_option, int width,
-                                 int height, bool shadow_enabled) {
+                                 int height, bool shadow_enabled,
+                                 const mjvGeom* extra_geoms, int num_extra_geoms) {
   Impl& s = *impl_;
 
   // Must be first each frame.
@@ -2456,6 +3024,13 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
           GeomAffine(data->geom_xpos + 3 * i, data->geom_xmat + 9 * i));
     }
   }
+
+  // --- Update the pooled decorations. Runs before the HasShapes gate because a
+  // scene with no model geoms can still have decorations (e.g. perturb ghosts),
+  // and this may create the first decoration shapes. It mutates the model graph
+  // structure, so it must precede the model-graph evaluation below.
+  s.UpdateDecorations(model, data, perturb, mj_camera, vis_option, extra_geoms,
+                      num_extra_geoms);
 
   // Bourbon's forward pass graph dereferences the world's shape-index buffer
   // unconditionally, and that buffer is a null (unallocated) DevicePtr when the
