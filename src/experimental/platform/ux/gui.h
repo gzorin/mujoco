@@ -36,6 +36,8 @@
 
 namespace mujoco::platform {
 
+class Renderer;
+
 // Standard default UX themes for MuJoCo applications.
 enum class GuiTheme {
   kLight,
@@ -163,9 +165,11 @@ void GroupsGui(const mjModel* model, mjvOption* vis_options, float min_width);
 
 // UX for enabling/disabling rendering (mjtRndFlag) and visualization
 // (mjtVisFlag) flags. We combine these into a single function because the sets
-// of flags are closely related.
+// of flags are closely related. `renderer` (may be null) is consulted so render
+// flags the active backend does not honour are shown disabled (greyed out).
 void RenderingGui(const mjModel* model, mjvOption* vis_options,
-                  mjtByte* render_flags, float min_width);
+                  mjtByte* render_flags, const Renderer* renderer,
+                  float min_width);
 
 // UX for controlling the mjvOption and mjvCamera settings used for visualizing
 // scenes (mjvScene).

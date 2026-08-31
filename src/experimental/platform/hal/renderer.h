@@ -58,6 +58,11 @@ class Renderer {
   // Rendering flags.
   virtual mjtByte* GetRenderFlags() = 0;
 
+  // Whether this backend honours the given mjtRndFlag. Backends that ignore a
+  // flag return false so the UI can disable (grey out) its toggle rather than
+  // presenting a control that silently does nothing. Defaults to "supported".
+  virtual bool SupportsRenderFlag(int flag) const { return true; }
+
   // Returns the current frame rate.
   virtual double GetFps() = 0;
 };

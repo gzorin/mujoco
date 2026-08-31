@@ -29,6 +29,7 @@
 #include <imgui_internal.h>
 #include <implot.h>
 #include <mujoco/mujoco.h>
+#include "experimental/platform/hal/renderer.h"
 #include "experimental/platform/helpers.h"
 #include "experimental/platform/sim/sim_history.h"
 #include "experimental/platform/sim/sim_profiler.h"
@@ -1722,7 +1723,8 @@ void VisualizationGui(mjModel* model, mjvOption* vis_options, mjvCamera* camera,
 }
 
 void RenderingGui(const mjModel* model, mjvOption* vis_options,
-                  mjtByte* render_flags, float min_width) {
+                  mjtByte* render_flags, const Renderer* renderer,
+                  float min_width) {
   const float available_width =
       GetStableAvailWidth() - ImGui::GetTreeNodeToLabelSpacing();
   const int num_cols = std::clamp(
@@ -1745,7 +1747,12 @@ void RenderingGui(const mjModel* model, mjvOption* vis_options,
       const ImVec2 size = GetFlexElementSize(num_cols);
       for (int i = 0; i < mjNRNDFLAG; ++i) {
         ImGui::TableNextColumn();
+        // Grey out flags the active backend does not honour, so a toggle that
+        // would silently do nothing reads as unavailable instead.
+        const bool supported = !renderer || renderer->SupportsRenderFlag(i);
+        ImGui::BeginDisabled(!supported);
         ImGui_ButtonToggle(mjRNDSTRING[i][0], &render_flags[i], size);
+        ImGui::EndDisabled();
       }
       ImGui::EndTable();
     }

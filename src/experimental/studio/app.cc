@@ -1393,7 +1393,7 @@ void App::ModelOptionsGui() {
     ImGui::PopID();
 
     platform::RenderingGui(model(), &vis_options_, renderer_->GetRenderFlags(),
-                           min_width);
+                           renderer_.get(), min_width);
     ImGui::TreePop();
   }
   ImGui::EndChild();

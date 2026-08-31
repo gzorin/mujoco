@@ -1590,6 +1590,21 @@ struct BourbonContext::Impl {
   bourbon::OITKind built_oit = bourbon::OITKind::None;
   bourbon::OITKind oit = bourbon::OITKind::None;
 
+  // Debug draw mode. bourbon's forward path chooses the real integration task
+  // vs a debug-viz surface by the surface Token at construction
+  // (ForwardIntegrator.cpp:41: surface=="lit" integrates, anything else builds a
+  // ForwardVizTask), so lit-vs-viz is structural and lives in the pass-graph
+  // key. `viz_depth` (mjRND_DEPTH) renders bourbon's "depth" surface -- the one
+  // debug surface that maps to a MuJoCo render flag. Wireframe and segmentation
+  // have no bourbon path (no exposed fill mode; the id-colour surface needs a
+  // separate IBuffer integrator chain), so they are greyed out in the GUI
+  // rather than wired here. The depth surface writes window-space z in [0,1]
+  // into the HDR colour buffer, so the camera exposure is switched to Manual 1.0
+  // while it is active (see ApplyExposure) -- otherwise the ~1e-4 photometric
+  // exposure the ResolvePass applies would crush it to black.
+  bool viz_depth = false;
+  bool built_viz_depth = false;
+
   // Whether IndirectDraws' persistent device buffer has been produced by at
   // least one shadowless render drain. IndirectDraws produces that buffer only
   // in its "stage 1", gated on shape_kind_morphology being dirty -- which is the
@@ -1699,8 +1714,11 @@ struct BourbonContext::Impl {
         .tap = bourbon::Tap::Color,
         .clustered = false,
     };
+    // "lit" builds the real integration task; any other surface builds a
+    // ForwardVizTask (ForwardIntegrator.cpp:41). "depth" paints window-space z.
     bourbon::ForwardVizTask::Params forward_viz = {
-        .surface = bourbon::Token::Get("lit"),
+        .surface = viz_depth ? bourbon::Token::Get("depth")
+                             : bourbon::Token::Get("lit"),
         .texture = bourbon::Token::Get("material"),
     };
 
@@ -1718,6 +1736,7 @@ struct BourbonContext::Impl {
 
     built_mode = mode;
     built_oit = oit;
+    built_viz_depth = viz_depth;
     built_valid = true;
   }
 
@@ -1739,6 +1758,28 @@ struct BourbonContext::Impl {
     BuildPassGraph(mode);
     pass_heap->allocate();
     built_shadow_morphology = shadow_morphology;
+  }
+
+  // Sets the camera exposure for the current draw mode. The lit path uses the
+  // photometric "sunny-16" preset (calibrated against the scene's physical light
+  // magnitudes; see the constructor). A debug-viz surface writes plain [0,1]
+  // data (e.g. depth) into the HDR buffer, which the photometric exposure (~1e-4)
+  // would crush in the ResolvePass, so viz modes switch to Manual exposure 1.0;
+  // ACES + sRGB in the resolve then map [0,1] to a visible ramp. All pushes are
+  // change-gated, so this is a no-op on steady state.
+  void ApplyExposure(bool viz) {
+    if (viz) {
+      camera->exposure_mode().setValueIfChanged(
+          bourbon::Camera::ExposureMode::Manual);
+      camera->exposure().setValueIfChanged(1.0f);
+    } else {
+      camera->exposure_mode().setValueIfChanged(
+          bourbon::Camera::ExposureMode::Photometric);
+      camera->f_number().setValueIfChanged(16.0f);
+      camera->shutter_time().setValueIfChanged(1.0f / 125.0f);
+      camera->iso().setValueIfChanged(100.0f);
+      camera->ev_compensation().setValueIfChanged(0.0f);
+    }
   }
 
   // Uploads a host triangle soup as a bourbon TriangleMesh Shape, deriving
@@ -3108,9 +3149,16 @@ void BourbonContext::SetClearColor(float r, float g, float b, float a) {
 void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
                                  const mjvPerturb* perturb, mjvCamera* mj_camera,
                                  const mjvOption* vis_option, int width,
-                                 int height, bool shadow_enabled,
+                                 int height, const mjtByte* render_flags,
                                  const mjvGeom* extra_geoms, int num_extra_geoms) {
   Impl& s = *impl_;
+
+  const bool shadow_enabled = render_flags && render_flags[mjRND_SHADOW];
+  // Depth visualization (mjRND_DEPTH) swaps the forward path to the "depth"
+  // surface; this is structural (see viz_depth) and picked up by the pass-graph
+  // rebuild below. The exposure is switched to suit whichever mode is active.
+  s.viz_depth = render_flags && render_flags[mjRND_DEPTH];
+  s.ApplyExposure(s.viz_depth);
 
   // Must be first each frame.
   s.core->advanceCompletionTimestamp();
@@ -3252,7 +3300,8 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     // pushed every frame so the submission back-end matches the built graph.
     const uint64_t morphology = s.world->shadow_source_morphology().value();
     if (!s.built_valid || s.built_mode != desired_mode ||
-        s.built_shadow_morphology != morphology || s.built_oit != s.oit) {
+        s.built_shadow_morphology != morphology || s.built_oit != s.oit ||
+        s.built_viz_depth != s.viz_depth) {
       s.RebuildPassGraph(desired_mode, morphology);
     }
     s.draw_submission->setMode(desired_mode);

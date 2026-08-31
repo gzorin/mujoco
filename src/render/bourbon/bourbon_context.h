@@ -50,10 +50,10 @@ class BourbonContext {
   // Renders one frame: updates the camera from `camera`, evaluates the bourbon
   // scene/pass graph into the drawable, draws the current ImGui frame on top,
   // then presents. Owns the ImGui::Render() call. The caller must have built the
-  // ImGui frame (ImGui::NewFrame ... widgets) beforehand. `shadow_enabled`
-  // (mjRND_SHADOW) toggles shadow casting; enabling it switches the pass graph
-  // onto a non-Direct submission mode. `vis_option` may be null; mjVIS_TRANSPARENT
-  // is read from it to fade dynamic geoms.
+  // ImGui frame (ImGui::NewFrame ... widgets) beforehand. `render_flags` is the
+  // mjtByte[mjNRNDFLAG] array (may be null): mjRND_SHADOW toggles shadow casting
+  // and mjRND_DEPTH switches to the depth-visualization surface. `vis_option`
+  // may be null; mjVIS_TRANSPARENT is read from it to fade dynamic geoms.
   //
   // `perturb` and `extra_geoms` drive the pooled decorations: a private mjvScene
   // is updated with mjCAT_ALL, `extra_geoms` are appended as mjCAT_DECOR, and
@@ -62,7 +62,7 @@ class BourbonContext {
   void RenderFrame(const mjModel* model, mjData* data,
                    const mjvPerturb* perturb, mjvCamera* camera,
                    const mjvOption* vis_option, int width, int height,
-                   bool shadow_enabled, const mjvGeom* extra_geoms,
+                   const mjtByte* render_flags, const mjvGeom* extra_geoms,
                    int num_extra_geoms);
 
   // Frames-per-second, exponentially smoothed.

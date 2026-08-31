@@ -53,6 +53,8 @@ class BourbonRenderer : public Renderer {
 
   mjtByte* GetRenderFlags() override;
 
+  bool SupportsRenderFlag(int flag) const override;
+
   double GetFps() override;
 
  private:

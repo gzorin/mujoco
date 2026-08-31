@@ -43,7 +43,7 @@ void BourbonRenderer::Render(const mjModel* model, mjData* data,
                              std::span<std::byte> pixels,
                              std::span<mjvGeom> extra_geoms) {
   context_->RenderFrame(model, data, perturb, camera, vis_option, width, height,
-                        render_flags_[mjRND_SHADOW] != 0, extra_geoms.data(),
+                        render_flags_, extra_geoms.data(),
                         static_cast<int>(extra_geoms.size()));
 }
 
@@ -63,6 +63,21 @@ int BourbonRenderer::UploadImage(int texture_id, const std::byte* pixels,
 }
 
 mjtByte* BourbonRenderer::GetRenderFlags() { return render_flags_; }
+
+bool BourbonRenderer::SupportsRenderFlag(int flag) const {
+  // The bourbon backend currently honours only shadows and depth
+  // visualization. Wireframe has no exposed fill mode in bourbon; segmentation
+  // (SEGMENT/IDCOLOR) would need a separate IBuffer integrator chain that would
+  // not reproduce MuJoCo's segids; reflection, additive, skybox, fog, haze, and
+  // face culling have no bourbon equivalent. The rest are greyed out in the UI.
+  switch (flag) {
+    case mjRND_SHADOW:
+    case mjRND_DEPTH:
+      return true;
+    default:
+      return false;
+  }
+}
 
 double BourbonRenderer::GetFps() { return context_->GetFps(); }
 
