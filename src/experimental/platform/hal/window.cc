@@ -53,6 +53,13 @@ static void InitImGui(SDL_Window* window, float content_scale,
   ImGuiIO& io = ImGui::GetIO();
   io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  // MuJoCo's scene interaction uses the physical Ctrl key for perturbation on
+  // every platform (as in `simulate`). ImGui's macOS behaviours (default-on
+  // under __APPLE__) remap io.KeyCtrl onto Cmd and alias Ctrl+Left-click into a
+  // right-click, both of which break Ctrl+drag body manipulation. Disable them
+  // so Ctrl means Ctrl everywhere; ImGui's own text shortcuts then use Ctrl too,
+  // which is the consistent choice for a MuJoCo-style viewer.
+  io.ConfigMacOSXBehaviors = false;
   io.IniFilename = nullptr;
   io.ConfigDpiScaleFonts = true;
   io.ConfigDpiScaleViewports = true;
