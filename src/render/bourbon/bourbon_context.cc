@@ -984,6 +984,23 @@ bool IsDynamicGeom(const mjModel* m, int i) {
   return m->body_weldid[m->geom_bodyid[i]] != 0;
 }
 
+// Whether model geom `i` should be drawn under `opt`, mirroring the two model-
+// geom filters mjv_addGeoms applies (engine_vis_visualize.c:962-971) and the
+// filter Pick passes to mj_ray (interaction.cc:347), so render and pick agree:
+// its geom group must be enabled, and static-body geoms are hidden unless
+// mjVIS_STATIC is set. All other mjVIS_* flags act on categories bourbon does
+// not yet retain (sites/tendons/actuators) or are handled elsewhere
+// (mjVIS_TRANSPARENT in UpdateTransparency).
+bool GeomVisibleUnderOption(const mjModel* m, const mjvOption& opt, int i) {
+  const int g = m->geom_group[i];
+  const int gc = g < 0 ? 0 : (g >= mjNGROUP ? mjNGROUP - 1 : g);
+  if (!opt.geomgroup[gc]) return false;
+  if (!opt.flags[mjVIS_STATIC] && m->body_weldid[m->geom_bodyid[i]] == 0) {
+    return false;
+  }
+  return true;
+}
+
 // A retained scene element: an owned SGNode with a rigid transform, a shared
 // shape, and a material. Sizes are baked into the shape's parameters and the
 // node transform is kept strictly rigid (rotation + translation), which is
@@ -1017,6 +1034,10 @@ struct Renderable {
   bool dynamic = false;  // mjCAT_DYNAMIC: mjVIS_TRANSPARENT fades this geom
   bool blended = false;
   float applied_alpha = 1.0f;
+  // Whether the node is currently shown. Driven by the mjvOption geom-group and
+  // mjVIS_STATIC flags (UpdateVisibility); tracked so a node is only touched
+  // when its computed visibility actually changes. Nodes are created visible.
+  bool visible = true;
 };
 
 // A de-indexed triangle soup (3 vertices per triangle) staged on the host
@@ -2484,6 +2505,23 @@ struct BourbonContext::Impl {
   // user-toggled flag, so the alpha it produces is stable frame to frame; the
   // comparisons below are what keep this from touching the scene graph every
   // frame.
+  // Syncs each geom node's visibility to the mjvOption geom-group / mjVIS_STATIC
+  // filters. A hidden node is dropped from the draw but stays a world shape (as
+  // hidden decorations do), so this never trips the zero-shape guard. Toggling
+  // node visibility does not add/remove shapes, so it needs no shadow re-prime.
+  // A null option leaves everything visible (the prior always-drawn behaviour).
+  void UpdateVisibility(const mjModel* m, const mjvOption* opt) {
+    for (int i = 0; i < static_cast<int>(geoms.size()); ++i) {
+      Renderable& r = geoms[i];
+      if (!r.node) continue;
+      const bool vis = opt ? GeomVisibleUnderOption(m, *opt, i) : true;
+      if (vis != r.visible) {
+        r.node->setVisibility(vis);
+        r.visible = vis;
+      }
+    }
+  }
+
   bool UpdateTransparency(const mjModel* m, bool transparent) {
     const float fade = static_cast<float>(m->vis.map.alpha);
     bool swapped = false;
@@ -3094,6 +3132,9 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
       s.geoms[i].xform->local_matrix().setValueIfChanged(
           GeomAffine(data->geom_xpos + 3 * i, data->geom_xmat + 9 * i));
     }
+    // Sync geom-group / mjVIS_STATIC visibility so hidden groups are not drawn
+    // (matching what Pick already honours). Only touches nodes that changed.
+    s.UpdateVisibility(model, vis_option);
   }
 
   // --- Update the pooled decorations. Runs before the HasShapes gate because a
