@@ -427,14 +427,123 @@ void EffectiveGeomRgba(const mjModel* m, int i, float out[4]) {
   }
 }
 
-// Packs an RGBA colour into a 32-bit key (8 bits/channel) so materials that
-// share a flat colour are deduplicated exactly.
-uint32_t QuantizeRgba(const float rgba[4]) {
-  auto q = [](float v) -> uint32_t {
-    const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-    return static_cast<uint32_t>(c * 255.0f + 0.5f);
-  };
-  return (q(rgba[0]) << 24) | (q(rgba[1]) << 16) | (q(rgba[2]) << 8) | q(rgba[3]);
+// --- Material scalars --------------------------------------------------------
+//
+// glTFPbrPattern's uniform defaults are all ZERO: bourbon registers it with
+// PatternClass::ParamSpecs whose `value` is null throughout
+// (RendererContext.cpp), and PatternClass value-initializes the default
+// argument buffer. The MaterialX defaults the gltf_pbr node declares
+// (roughness 1, specular 1, ior 1.5, alpha 1) never reach the shader, because
+// the pattern drives every one of those BXDF inputs. So every field below must
+// be written explicitly -- leaving one out means roughness 0 (mirror-smooth)
+// and ior 0, not a sane default.
+//
+// The pattern has no ambient-occlusion input at all -- neither a scalar nor a
+// map slot (its TextureMaps are baseColor/metallicRoughness/transmission/
+// emissive/specular/sheen/normal, and `occlusion` is the one gltf_pbr BXDF
+// input bourbon's BXDFClass mapping leaves undriven, so it stays at the
+// MaterialX default of 1). mjTEXROLE_OCCLUSION therefore has no destination.
+
+// MuJoCo's default geom/material specular is 0.5 whereas glTF's default
+// specular weight is 1.0; scaling by two maps one default onto the other, so an
+// unconfigured MuJoCo model gets glTF's standard 4% dielectric F0.
+constexpr float kSpecularToGltf = 2.0f;
+
+// Index of refraction. MuJoCo has no equivalent field; 1.5 is glTF's default
+// and the value the Blinn-Phong specular mapping above is calibrated against.
+constexpr float kDefaultIor = 1.5f;
+
+// Upper bound of the OpenGL Blinn-Phong specular exponent, which is what
+// mat_shininess (in [0,1]) scales; used only for the roughness fallback.
+constexpr float kMaxShininessExponent = 128.0f;
+
+// MuJoCo material defaults for a geom with no material (mjv_initGeom,
+// engine_vis_visualize.c:391-394).
+constexpr float kDefaultEmission = 0.0f;
+constexpr float kDefaultSpecular = 0.5f;
+constexpr float kDefaultShininess = 0.5f;
+
+float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
+// The complete glTF-PBR parameter set for one geom, as handed to
+// Pattern::Create.
+struct MaterialSpec {
+  Eigen::Array4f base_color = {1.0f, 1.0f, 1.0f, 1.0f};
+  // rgb = specular tint, a = specular weight. glTFPbrPattern splits the vector
+  // exactly that way (outputs.specular = specular.a, specular_color =
+  // specular.rgb), and the BXDF forms F0 = min(specular_color * f0(ior), 1) *
+  // specular.
+  Eigen::Array4f specular = {1.0f, 1.0f, 1.0f, 1.0f};
+  Eigen::Array4f emissive = {0.0f, 0.0f, 0.0f, 0.0f};
+  float metallic = 0.0f;
+  float roughness = 1.0f;
+  float ior = kDefaultIor;
+  // Surface opacity. Ignored by the BXDF while alpha_mode is OPAQUE (the
+  // gltf_pbr graph forces opacity to 1 in that mode); transparency support
+  // sets alpha_mode and the matching SemiTransparencyKind together.
+  float alpha = 1.0f;
+
+  // Quantized identity, so geoms whose materials would render identically
+  // share one Pattern/Material. 1/4096 is far below any visible difference,
+  // and an integer key hashes and orders exactly.
+  std::array<int32_t, 16> Key() const {
+    auto q = [](float v) {
+      return static_cast<int32_t>(std::lround(v * 4096.0f));
+    };
+    return {q(base_color[0]), q(base_color[1]), q(base_color[2]),
+            q(base_color[3]), q(specular[0]),   q(specular[1]),
+            q(specular[2]),   q(specular[3]),   q(emissive[0]),
+            q(emissive[1]),   q(emissive[2]),   q(emissive[3]),
+            q(metallic),      q(roughness),     q(ior),
+            q(alpha)};
+  }
+};
+
+// Converts an OpenGL Blinn-Phong shininess (MuJoCo's mat_shininess, in [0,1],
+// scaling a specular exponent up to 128) to a GGX roughness. Used only when the
+// material states no explicit roughness.
+float RoughnessFromShininess(float shininess) {
+  const float exponent = Clamp01(shininess) * kMaxShininessExponent;
+  return Clamp01(std::pow(2.0f / (exponent + 2.0f), 0.25f));
+}
+
+// Derives the glTF-PBR parameters for geom `i`.
+//
+// This is the one place a retained renderer reading mjModel does better than
+// any mjvGeom-based one: mat_metallic and mat_roughness exist in mjModel and
+// are never copied into mjvGeom, so the classic and Filament paths cannot see
+// them. Both default to -1 meaning "unset" (mjs_defaultMaterial), so the
+// Blinn-Phong conversion remains the fallback for a geom with no material AND
+// for a material that authors shininess but no roughness.
+MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
+  MaterialSpec spec;
+  float rgba[4];
+  EffectiveGeomRgba(m, i, rgba);
+  spec.base_color = {rgba[0], rgba[1], rgba[2], rgba[3]};
+  spec.alpha = rgba[3];
+
+  const int matid = m->geom_matid[i];
+  const float emission =
+      matid >= 0 ? m->mat_emission[matid] : kDefaultEmission;
+  const float specular =
+      matid >= 0 ? m->mat_specular[matid] : kDefaultSpecular;
+  const float shininess =
+      matid >= 0 ? m->mat_shininess[matid] : kDefaultShininess;
+
+  const float metallic = matid >= 0 ? m->mat_metallic[matid] : -1.0f;
+  spec.metallic = metallic >= 0.0f ? Clamp01(metallic) : 0.0f;
+
+  const float roughness = matid >= 0 ? m->mat_roughness[matid] : -1.0f;
+  spec.roughness = roughness >= 0.0f ? Clamp01(roughness)
+                                     : RoughnessFromShininess(shininess);
+
+  const float s = Clamp01(specular) * kSpecularToGltf;
+  spec.specular = {s, s, s, 1.0f};
+  spec.ior = kDefaultIor;
+  // MuJoCo's emission is a scalar multiplier on the geom's own colour.
+  spec.emissive = {emission * rgba[0], emission * rgba[1], emission * rgba[2],
+                   0.0f};
+  return spec;
 }
 
 // A de-indexed triangle soup (3 vertices per triangle) staged on the host
@@ -776,12 +885,13 @@ struct BourbonContext::Impl {
   Eigen::Array4f clear_color = {0.12f, 0.14f, 0.18f, 1.0f};
 
   // Retained scene: one entry per model geom (size ngeom; entries for
-  // unsupported geom types have a null node). Plus a per-colour flat-material
-  // cache and a single hard-coded distant light (Stage 1).
+  // unsupported geom types have a null node), plus a material cache keyed on
+  // the quantized glTF-PBR parameter set.
   std::vector<Renderable> geoms;
   const bourbon::BXDFClass* pbr_bxdf = nullptr;
   const bourbon::PatternClass* pbr_pattern = nullptr;
-  std::map<uint32_t, bourbon::RefPtr<bourbon::Material>> material_cache;
+  std::map<std::array<int32_t, 16>, bourbon::RefPtr<bourbon::Material>>
+      material_cache;
   // TriangleMesh shape caches, so geoms sharing a mesh/hfield share one Shape.
   std::map<int, bourbon::RefPtr<bourbon::Shape>> mesh_shape_cache;
   std::map<int, bourbon::RefPtr<bourbon::Shape>> hfield_shape_cache;
@@ -969,16 +1079,41 @@ struct BourbonContext::Impl {
     env_source_image.reset();
   }
 
-  // Returns a flat glTF-PBR material for `rgba`, creating and caching one per
-  // distinct (quantized) colour so geoms that share a colour share a material.
-  bourbon::RefPtr<bourbon::Material> GetOrCreateMaterial(const float rgba[4]) {
-    const uint32_t key = QuantizeRgba(rgba);
+  // Returns the glTF-PBR material for `spec`, creating and caching one per
+  // distinct (quantized) parameter set so geoms that would render identically
+  // share a Pattern and Material.
+  //
+  // Pattern::Params values are type-erased `const void*` that Pattern's
+  // constructor memcpys into its argument block, so the pointed-to storage only
+  // has to outlive this call.
+  bourbon::RefPtr<bourbon::Material> GetOrCreateMaterial(
+      const MaterialSpec& spec) {
+    const std::array<int32_t, 16> key = spec.Key();
     auto it = material_cache.find(key);
     if (it != material_cache.end()) return it->second;
 
-    Eigen::Array4f base_color = {rgba[0], rgba[1], rgba[2], rgba[3]};
-    bourbon::Pattern::Params params = {
-        {bourbon::Token::Get("baseColor"), &base_color}};
+    // OPAQUE. The gltf_pbr graph forces opacity to 1 in this mode, so `alpha`
+    // is carried but inert until transparency support flips both this and the
+    // Pattern's SemiTransparencyKind.
+    const int32_t alpha_mode = 0;
+    const float alpha_cutoff = 0.5f;
+    const float transmission = 0.0f;
+    const Eigen::Array4f sheen = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    using bourbon::Token;
+    const bourbon::Pattern::Params params = {
+        {Token::Get("baseColor"), &spec.base_color},
+        {Token::Get("metallic"), &spec.metallic},
+        {Token::Get("roughness"), &spec.roughness},
+        {Token::Get("transmission"), &transmission},
+        {Token::Get("specular"), &spec.specular},
+        {Token::Get("ior"), &spec.ior},
+        {Token::Get("alpha"), &spec.alpha},
+        {Token::Get("alpha_mode"), &alpha_mode},
+        {Token::Get("alpha_cutoff"), &alpha_cutoff},
+        {Token::Get("sheen"), &sheen},
+        {Token::Get("emissive"), &spec.emissive},
+    };
     auto material = bourbon::Material::Create(
         pbr_bxdf,
         bourbon::Pattern::Create(*pbr_pattern, params, {},
@@ -989,8 +1124,8 @@ struct BourbonContext::Impl {
     return material;
   }
 
-  // Builds the retained scene for `m`: a shared flat material, one node/shape
-  // per supported geom (transforms updated per frame), and one distant light.
+  // Builds the retained scene for `m`: one node/shape/material per supported
+  // geom (transforms updated per frame), and the model's lights.
   void BuildScene(const mjModel* m) {
     model = m;
     if (!m) return;
@@ -999,9 +1134,8 @@ struct BourbonContext::Impl {
     bourbon::SGContext& sg = *sg_context;
     bourbon::Model& scene = world->model();
 
-    // Flat glTF-PBR material templates; GetOrCreateMaterial() instantiates one
-    // per distinct geom colour (Stage 3 replaces these with per-material
-    // scalars/textures).
+    // glTF-PBR material templates; GetOrCreateMaterial() instantiates one per
+    // distinct parameter set (see MaterialSpecForGeom).
     pbr_bxdf = renderer_context->findBXDF(bourbon::Token::Get("glTFPbrBXDF"));
     pbr_pattern =
         renderer_context->findPattern(bourbon::Token::Get("glTFPbrPattern"));
@@ -1010,9 +1144,8 @@ struct BourbonContext::Impl {
     for (int i = 0; i < m->ngeom; ++i) {
       bourbon::RefPtr<bourbon::Shape> shape = MakeShapeForGeom(m, i);
       if (!shape) continue;
-      float rgba[4];
-      EffectiveGeomRgba(m, i, rgba);
-      bourbon::RefPtr<bourbon::Material> material = GetOrCreateMaterial(rgba);
+      bourbon::RefPtr<bourbon::Material> material =
+          GetOrCreateMaterial(MaterialSpecForGeom(m, i));
       bourbon::SGNode* node = scene.createNode();
       scene.addRootNode(*node);
       auto xform = bourbon::MatrixTransformer::Create(g);
