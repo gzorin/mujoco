@@ -413,22 +413,27 @@ Eigen::Vector3f ReadVec3(const mjtNum* p) {
                          static_cast<float>(p[2]));
 }
 
-// Resolves the effective RGBA of geom `i`, mirroring MuJoCo's setMaterial()
-// (engine_vis_visualize.c:225): the material colour is used when the geom has a
-// material, but the per-geom rgba overrides it whenever it differs from the
-// default (0.5,0.5,0.5,1) or the geom has no material.
-void EffectiveGeomRgba(const mjModel* m, int i, float out[4]) {
-  const int matid = m->geom_matid[i];
-  const float* geom_rgba = m->geom_rgba + 4 * i;
+// Resolves the effective RGBA of an object with material `matid` and per-object
+// override `obj_rgba`, mirroring MuJoCo's setMaterial() (engine_vis_visualize.c:
+// 225): the material colour is used when the object has a material, but the
+// per-object rgba overrides it whenever it differs from the default
+// (0.5,0.5,0.5,1) or there is no material. Shared by geoms, flexes and skins.
+void EffectiveRgba(const mjModel* m, int matid, const float* obj_rgba,
+                   float out[4]) {
   if (matid >= 0) {
     const float* mr = m->mat_rgba + 4 * matid;
     out[0] = mr[0]; out[1] = mr[1]; out[2] = mr[2]; out[3] = mr[3];
   }
-  if (geom_rgba[0] != 0.5f || geom_rgba[1] != 0.5f || geom_rgba[2] != 0.5f ||
-      geom_rgba[3] != 1.0f || matid < 0) {
-    out[0] = geom_rgba[0]; out[1] = geom_rgba[1];
-    out[2] = geom_rgba[2]; out[3] = geom_rgba[3];
+  if (obj_rgba[0] != 0.5f || obj_rgba[1] != 0.5f || obj_rgba[2] != 0.5f ||
+      obj_rgba[3] != 1.0f || matid < 0) {
+    out[0] = obj_rgba[0]; out[1] = obj_rgba[1];
+    out[2] = obj_rgba[2]; out[3] = obj_rgba[3];
   }
+}
+
+// Effective RGBA of geom `i`.
+void EffectiveGeomRgba(const mjModel* m, int i, float out[4]) {
+  EffectiveRgba(m, m->geom_matid[i], m->geom_rgba + 4 * i, out);
 }
 
 // --- Material scalars --------------------------------------------------------
@@ -864,22 +869,25 @@ float RoughnessFromShininess(float shininess) {
   return Clamp01(std::pow(2.0f / (exponent + 2.0f), 0.25f));
 }
 
-// Derives the glTF-PBR parameters for geom `i`.
+// Derives the glTF-PBR parameters common to geoms, flexes and skins: the scalar
+// mapping and the texture-role -> pattern-slot bindings. `rgba` is the already-
+// resolved effective surface colour; `matid` its material (-1 for none);
+// `allow_textures` whether texture roles apply at all (a flex/skin with no
+// texcoords renders untextured, matching classic). When any texture binds,
+// `texgen` is stored so the sampler has coordinates.
 //
 // This is the one place a retained renderer reading mjModel does better than
 // any mjvGeom-based one: mat_metallic and mat_roughness exist in mjModel and
 // are never copied into mjvGeom, so the classic and Filament paths cannot see
 // them. Both default to -1 meaning "unset" (mjs_defaultMaterial), so the
-// Blinn-Phong conversion remains the fallback for a geom with no material AND
+// Blinn-Phong conversion remains the fallback for a surface with no material AND
 // for a material that authors shininess but no roughness.
-MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
-  MaterialSpec spec;
-  float rgba[4];
-  EffectiveGeomRgba(m, i, rgba);
+void ApplyMaterial(MaterialSpec& spec, const mjModel* m, int matid,
+                   const float rgba[4], bool allow_textures,
+                   const TexGen& texgen) {
   spec.base_color = {rgba[0], rgba[1], rgba[2], rgba[3]};
   spec.alpha = rgba[3];
 
-  const int matid = m->geom_matid[i];
   const float emission =
       matid >= 0 ? m->mat_emission[matid] : kDefaultEmission;
   const float specular =
@@ -897,11 +905,11 @@ MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
   const float s = Clamp01(specular) * kSpecularToGltf;
   spec.specular = {s, s, s, 1.0f};
   spec.ior = kDefaultIor;
-  // MuJoCo's emission is a scalar multiplier on the geom's own colour.
+  // MuJoCo's emission is a scalar multiplier on the surface's own colour.
   spec.emissive = {emission * rgba[0], emission * rgba[1], emission * rgba[2],
                    0.0f};
 
-  if (matid < 0) return spec;
+  if (matid < 0 || !allow_textures) return;
 
   // Texture roles -> glTFPbrPattern slots. mat_texid is nmat x mjNTEXROLE.
   //
@@ -959,20 +967,66 @@ MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
   if (emissive >= 0) {
     spec.emissive_map = {ImagePacking::Color, emissive};
     // The emissive map multiplies the emissive uniform, so a material with a
-    // map but the default emission of 0 would be black. Use the geom colour at
-    // full strength in that case and let the map carry the variation.
+    // map but the default emission of 0 would be black. Use the surface colour
+    // at full strength in that case and let the map carry the variation.
     if (emission <= 0.0f) {
       spec.emissive = {rgba[0], rgba[1], rgba[2], 0.0f};
     }
   }
 
   // Only give the spec a coordinate generation if something actually samples
-  // with it: texgen depends on the geom's own size, so letting it into the key
-  // for an untextured material would fragment the cache by geom size.
+  // with it: texgen depends on the surface's own size, so letting it into the
+  // key for an untextured material would fragment the cache by size.
   if (spec.base_color_map.bound() || spec.metallic_roughness_map.bound() ||
       spec.normal_map.bound() || spec.emissive_map.bound()) {
-    spec.texgen = TexGenForGeom(m, i);
+    spec.texgen = texgen;
   }
+}
+
+// Derives the glTF-PBR parameters for geom `i`.
+MaterialSpec MaterialSpecForGeom(const mjModel* m, int i) {
+  MaterialSpec spec;
+  float rgba[4];
+  EffectiveGeomRgba(m, i, rgba);
+  ApplyMaterial(spec, m, m->geom_matid[i], rgba, /*allow_textures=*/true,
+                TexGenForGeom(m, i));
+  return spec;
+}
+
+// The coordinate generation for a flex/skin surface. Unlike SDF primitives,
+// flexes and skins carry real per-vertex texture coordinates (flextexcoord /
+// skin_texcoord), so the shape's own st is used directly, with the material's
+// texrepeat applied as a scale (TransformUVCoordMap, the KHR_texture_transform
+// path -- the same as a mesh with UVs).
+TexGen FlexSkinTexGen(const mjModel* m, int matid) {
+  TexGen tg;
+  tg.kind = TexGen::Kind::Uv;
+  const float rep0 = matid >= 0 ? m->mat_texrepeat[2 * matid + 0] : 1.0f;
+  const float rep1 = matid >= 0 ? m->mat_texrepeat[2 * matid + 1] : 1.0f;
+  tg.scale = {rep0 > 0.0f ? rep0 : 1.0f, rep1 > 0.0f ? rep1 : 1.0f};
+  return tg;
+}
+
+// glTF-PBR parameters for flex `f`. Textures apply only when the flex has
+// texcoords (matching addFlexGeoms, which strips the material otherwise).
+MaterialSpec MaterialSpecForFlex(const mjModel* m, int f) {
+  MaterialSpec spec;
+  const int matid = m->flex_matid[f];
+  float rgba[4];
+  EffectiveRgba(m, matid, m->flex_rgba + 4 * f, rgba);
+  ApplyMaterial(spec, m, matid, rgba, m->flex_texcoordadr[f] >= 0,
+                FlexSkinTexGen(m, matid));
+  return spec;
+}
+
+// glTF-PBR parameters for skin `s`.
+MaterialSpec MaterialSpecForSkin(const mjModel* m, int s) {
+  MaterialSpec spec;
+  const int matid = m->skin_matid[s];
+  float rgba[4];
+  EffectiveRgba(m, matid, m->skin_rgba + 4 * s, rgba);
+  ApplyMaterial(spec, m, matid, rgba, m->skin_texcoordadr[s] >= 0,
+                FlexSkinTexGen(m, matid));
   return spec;
 }
 
@@ -1039,6 +1093,41 @@ struct Renderable {
   // when its computed visibility actually changes. Nodes are created visible.
   bool visible = true;
 };
+
+// A retained flex or skin surface. Unlike a geom, its vertices are world-space
+// and deform every frame, so the node and its identity MatrixTransformer are
+// permanent while the Shape is swapped out whenever the geometry changes: the
+// swap is gated on a checksum of the source vertices, so a static flex/skin
+// costs only the checksum after the first build. All the swap goes through one
+// function (SetFlexSkinShape) so a future in-place TriangleMesh position update
+// (a planned bourbon-side change) is a localized edit. Flexes and skins share
+// this type; they live in parallel lists indexed by flex/skin id.
+struct FlexSkin {
+  bourbon::SGNode* node = nullptr;  // owned by world->model(), identity xform
+  bourbon::RefPtr<bourbon::MatrixTransformer> xform;  // identity (world-space verts)
+  bourbon::RefPtr<bourbon::Shape> shape;              // swapped on deformation
+  bourbon::ShapeInstance* shape_instance = nullptr;   // owned by node
+  bourbon::RefPtr<bourbon::Material> material;         // currently-bound material
+  MaterialSpec spec;         // base parameter set (before alpha fade / glow)
+  bool has_shape = false;    // whether a Shape is currently attached
+  bool blended = false;      // current material is a Blend variant
+  bool highlighted = false;  // current material carries the selection glow
+  bool visible = true;       // node visibility (flags/group)
+  uint64_t checksum = 0;     // change-detection over the source vertices
+};
+
+// FNV-1a over `n` 32-bit words (floats reinterpreted), mixed with `seed`. Used
+// to detect whether a flex/skin's source vertices changed since the last frame
+// so an unchanged surface skips the Shape rebuild entirely.
+uint64_t HashFloats(const float* p, size_t n, uint64_t seed) {
+  uint64_t h = (1469598103934665603ull ^ seed) * 1099511628211ull;
+  const uint32_t* w = reinterpret_cast<const uint32_t*>(p);
+  for (size_t i = 0; i < n; ++i) {
+    h ^= w[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
 
 // A de-indexed triangle soup (3 vertices per triangle) staged on the host
 // before upload as a bourbon TriangleMesh. Normals are always supplied;
@@ -1536,18 +1625,25 @@ struct BourbonContext::Impl {
   bourbon::CommandQueue* queue = nullptr;  // owned by core.
 
   // Two dataflow graphs: the model graph (scene state) and the render graph
-  // (pass chain), each with its own evaluator and scratch heap.
+  // (pass chain), each with its own evaluator and scratch heap. Each heap is
+  // declared -- and so destroyed -- before its evaluator: a TaskGraphEvaluator
+  // can still be holding a leftover suspended GPU encode (SuspendedEncodingPool)
+  // whose captured FramebufferSpec references a TextureAllocation that calls
+  // back into its owning heap on destruction, so the heap must outlive the
+  // evaluator.
   std::unique_ptr<bourbon::TaskGraph> model_graph;
-  std::unique_ptr<bourbon::TaskGraphEvaluator> model_graph_evaluator;
   std::unique_ptr<bourbon::PersistentHeap> model_heap;
+  std::unique_ptr<bourbon::TaskGraphEvaluator> model_graph_evaluator;
+
   std::unique_ptr<bourbon::TaskGraph> render_graph;
-  std::unique_ptr<bourbon::TaskGraphEvaluator> render_graph_evaluator;
   std::unique_ptr<bourbon::PersistentHeap> render_heap;
   // Persistent heap for the pass-graph tasks' construction-time allocations
   // (integrator, ShadowTask cull buffers, render-target rings, ...). Allocated
   // once and never freed per frame, unlike render_heap (per-frame eval scratch),
-  // so those buffers are not reclaimed underneath the tasks.
+  // so those buffers are not reclaimed underneath the tasks. Declared before
+  // render_graph_evaluator for the same reason as render_heap above.
   std::unique_ptr<bourbon::PersistentHeap> pass_heap;
+  std::unique_ptr<bourbon::TaskGraphEvaluator> render_graph_evaluator;
 
   std::unique_ptr<bourbon::World> world;
 
@@ -1672,6 +1768,19 @@ struct BourbonContext::Impl {
   // `highlighted_body` is the body currently highlighted (-1 = none), so the set
   // is only reworked when the selection actually changes.
   int highlighted_body = -1;
+
+  // Retained flex/skin surfaces, indexed by flex/skin id (sizes nflex/nskin).
+  // Their world-space, deforming geometry is read each frame from the private
+  // decoration mjvScene (mjv_updateScene fills flexface/flexnormal/flextexcoord
+  // and skinvert/skinnormal there); see UpdateFlexSkin. A flex/skin is
+  // highlighted via the same opaque emissive-boost material swap the body
+  // selection uses, driven by perturb->flexselect / perturb->skinselect. Only
+  // one flex or skin is highlighted at a time (body > flex > skin, matching the
+  // Filament renderer), so these track the current id (-1 = none).
+  std::vector<FlexSkin> flexes;  // size nflex
+  std::vector<FlexSkin> skins;   // size nskin
+  int highlighted_flex = -1;
+  int highlighted_skin = -1;
 
   // Retained lights: one per mjModel light (an mjLIGHT_IMAGE slot is left
   // source-less -- its texture drives the environment light instead), then the
@@ -1885,6 +1994,12 @@ struct BourbonContext::Impl {
     lights.clear();
     env_source_image.reset();
     highlighted_body = -1;
+    // Flex/skin nodes were just destroyed by destroyAllRootNodes; drop the
+    // (now dangling) bookkeeping so BuildScene rebuilds them for the new model.
+    flexes.clear();
+    skins.clear();
+    highlighted_flex = -1;
+    highlighted_skin = -1;
     // Decoration pool: the nodes were just destroyed by destroyAllRootNodes, so
     // drop the (now dangling) slot bookkeeping and free the private scene, which
     // is model-specific and remade on the next Init.
@@ -2143,7 +2258,44 @@ struct BourbonContext::Impl {
       if (blended) any_transparent = true;
     }
 
+    BuildFlexSkinNodes(m);
     BuildLights(m);
+  }
+
+  // Creates one permanent node + identity MatrixTransformer per flex and skin,
+  // with its base material precomputed. No Shape is attached yet: flex/skin
+  // geometry is world-space and depends on the runtime option flags and the
+  // current deformation, so the Shape is attached (and later swapped) per frame
+  // in UpdateFlexSkin. The transform stays identity forever -- the vertices are
+  // already in world space.
+  void BuildFlexSkinNodes(const mjModel* m) {
+    bourbon::TaskGraph& g = *model_graph;
+    bourbon::Model& scene = world->model();
+    auto make = [&](MaterialSpec spec) {
+      FlexSkin fs;
+      fs.spec = spec;
+      fs.blended = spec.alpha < 1.0f;
+      fs.material = GetOrCreateMaterial(
+          m, spec,
+          fs.blended ? bourbon::SemiTransparencyKind::Blend
+                     : bourbon::SemiTransparencyKind::Opaque);
+      fs.node = scene.createNode();
+      scene.addRootNode(*fs.node);
+      fs.xform = bourbon::MatrixTransformer::Create(g);
+      fs.xform->local_matrix().setValueIfChanged(Eigen::Affine3f::Identity());
+      fs.node->setTransformer(fs.xform);
+      return fs;
+    };
+    flexes.clear();
+    flexes.reserve(m->nflex);
+    for (int f = 0; f < m->nflex; ++f) {
+      flexes.push_back(make(MaterialSpecForFlex(m, f)));
+    }
+    skins.clear();
+    skins.reserve(m->nskin);
+    for (int s = 0; s < m->nskin; ++s) {
+      skins.push_back(make(MaterialSpecForSkin(m, s)));
+    }
   }
 
   // Whether any geom produced a renderable node. Bourbon's forward pass graph
@@ -2153,6 +2305,12 @@ struct BourbonContext::Impl {
     if (decor_shape_count > 0) return true;  // pooled decor parts persist hidden
     for (const auto& r : geoms) {
       if (r.node) return true;
+    }
+    for (const auto& fs : flexes) {
+      if (fs.has_shape) return true;
+    }
+    for (const auto& fs : skins) {
+      if (fs.has_shape) return true;
     }
     return false;
   }
@@ -2632,16 +2790,25 @@ struct BourbonContext::Impl {
   // The glow variant of geom `i`'s material: its own parameter set with a warm
   // emissive boost (in nits, so it survives the exposure), at the geom's current
   // SemiTransparencyKind. Cached like any other material.
-  bourbon::RefPtr<bourbon::Material> HighlightMaterialFor(const mjModel* m,
-                                                          const Renderable& r) {
-    MaterialSpec spec = r.spec;
+  // The glow variant of `base`: its own parameter set with a warm emissive
+  // boost (in nits, so it survives the exposure), at the given blend behaviour.
+  // Cached like any other material. Shared by body, flex and skin selection.
+  bourbon::RefPtr<bourbon::Material> HighlightMaterial(const mjModel* m,
+                                                       const MaterialSpec& base,
+                                                       bool blended) {
+    MaterialSpec spec = base;
     const float nits = decor_emissive_nits;
     spec.emissive[0] += kHighlightColor[0] * nits;
     spec.emissive[1] += kHighlightColor[1] * nits;
     spec.emissive[2] += kHighlightColor[2] * nits;
     return GetOrCreateMaterial(m, spec,
-                               r.blended ? bourbon::SemiTransparencyKind::Blend
-                                         : bourbon::SemiTransparencyKind::Opaque);
+                               blended ? bourbon::SemiTransparencyKind::Blend
+                                       : bourbon::SemiTransparencyKind::Opaque);
+  }
+
+  bourbon::RefPtr<bourbon::Material> HighlightMaterialFor(const mjModel* m,
+                                                          const Renderable& r) {
+    return HighlightMaterial(m, r.spec, r.blended);
   }
 
   bool UpdateSelection(const mjModel* m, int select) {
@@ -2671,6 +2838,240 @@ struct BourbonContext::Impl {
     }
     if (changed) primed = false;
     return changed;
+  }
+
+  // --- Flex / skin -----------------------------------------------------------
+  //
+  // Flexes and skins are lit, retained surfaces on the opaque HDR path (like
+  // model geoms, NOT the unlit decoration path). Their fully-deformed, world-
+  // space geometry is already computed by mjv_updateScene into the private
+  // decoration mjvScene (run in UpdateDecorations, which precedes this):
+  //   - flex faces: a ready de-indexed triangle soup in decor_scene.flexface
+  //     (9 floats/face), flexnormal (9/face), flextexcoord (6/face); per-flex
+  //     range flexfaceadr[f], live count flexfaceused[f].
+  //   - skin verts: decor_scene.skinvert (bone-blended, 3/vert) + skinnormal,
+  //     de-indexed here with mjModel skin_face over skin_faceadr/facenum, and
+  //     texcoords from mjModel skin_texcoord.
+  // So no bone-blend / element-vs-smooth port is needed; the arrays are handed
+  // straight to the shared mesh-upload path.
+  //
+  // The node + its identity transform are permanent (built once); only the Shape
+  // is swapped, and only when the source vertices change (gated on a checksum),
+  // so a static flex/skin costs just the checksum after the first build. Every
+  // shape/material rebind goes through SetFlexSkinShape.
+
+  // Removes the flex/skin's current instance and, if `shape` is non-null,
+  // adopts it as the held shape; then (re)attaches the held shape with
+  // `material`. A null held shape after this leaves the node shape-less (hidden
+  // by absence). Any rebind re-dirties shape_kind_morphology, which re-runs
+  // IndirectDraws stage 1 and reallocates the buffer the shadow cull binds, so
+  // it re-primes (the same collision UpdateTransparency/UpdateSelection avoid).
+  void SetFlexSkinShape(FlexSkin& fs, bourbon::RefPtr<bourbon::Shape> shape,
+                        bourbon::RefPtr<bourbon::Material> material) {
+    if (fs.shape_instance) {
+      fs.node->removeSGObject(fs.shape_instance);
+      fs.shape_instance = nullptr;
+    }
+    if (shape) fs.shape = shape;
+    if (!fs.shape || !material) {
+      fs.has_shape = false;
+      primed = false;
+      return;
+    }
+    fs.shape_instance = fs.node->addShape(fs.shape, material, *model_heap,
+                                          *model_graph, *sg_context);
+    fs.material = material;
+    fs.has_shape = true;
+    primed = false;
+  }
+
+  // Stages flex `f`'s current faces from the decoration mjvScene into `mb` and
+  // sets `checksum` from the face data. Returns false when the flex has no
+  // active faces (1D flex, or face/skin rendering disabled).
+  bool BuildFlexMesh(int f, MeshBuild& mb, uint64_t& checksum) {
+    const int nface = decor_scene.flexfaceused[f];
+    if (nface <= 0) return false;
+    const int adr = decor_scene.flexfaceadr[f];
+    const float* face = decor_scene.flexface + 9 * adr;
+    const float* norm = decor_scene.flexnormal + 9 * adr;
+    const bool has_tc = model->flex_texcoordadr[f] >= 0;
+    const float* tex = has_tc ? decor_scene.flextexcoord + 6 * adr : nullptr;
+    checksum = HashFloats(face, static_cast<size_t>(9) * nface,
+                          static_cast<uint64_t>(nface));
+
+    const int nvert = 3 * nface;  // de-indexed triangle soup
+    mb.positions.resize(nvert);
+    mb.normals.resize(nvert);
+    mb.has_st = has_tc;
+    mb.sts.resize(has_tc ? nvert : 0);
+    for (int v = 0; v < nvert; ++v) {
+      mb.positions[v] = {face[3 * v], face[3 * v + 1], face[3 * v + 2]};
+      mb.normals[v] = {norm[3 * v], norm[3 * v + 1], norm[3 * v + 2]};
+      if (has_tc) mb.sts[v] = {tex[2 * v], tex[2 * v + 1]};
+    }
+    return true;
+  }
+
+  // Stages skin `s`'s current geometry: bone-blended world-space vertices and
+  // smoothed normals from the decoration mjvScene, de-indexed through mjModel's
+  // skin_face triangle list, with texcoords from mjModel skin_texcoord. Sets
+  // `checksum` from the (deforming) vertex positions. Returns false when the
+  // skin has no faces.
+  bool BuildSkinMesh(int s, MeshBuild& mb, uint64_t& checksum) {
+    const int facenum = model->skin_facenum[s];
+    if (facenum <= 0) return false;
+    const int vertadr = model->skin_vertadr[s];
+    const int vertnum = model->skin_vertnum[s];
+    const int faceadr = model->skin_faceadr[s];
+    const float* verts = decor_scene.skinvert + 3 * vertadr;
+    const float* norms = decor_scene.skinnormal + 3 * vertadr;
+    const int tcadr = model->skin_texcoordadr[s];
+    const bool has_tc = tcadr >= 0;
+    const float* tex = has_tc ? model->skin_texcoord + 2 * tcadr : nullptr;
+    checksum = HashFloats(verts, static_cast<size_t>(3) * vertnum,
+                          static_cast<uint64_t>(facenum));
+
+    const int nvert = 3 * facenum;
+    mb.positions.resize(nvert);
+    mb.normals.resize(nvert);
+    mb.has_st = has_tc;
+    mb.sts.resize(has_tc ? nvert : 0);
+    for (int fi = 0; fi < facenum; ++fi) {
+      const int* face = model->skin_face + 3 * (faceadr + fi);
+      for (int k = 0; k < 3; ++k) {
+        const int vid = face[k];  // local index within the skin
+        mb.positions[3 * fi + k] = {verts[3 * vid], verts[3 * vid + 1],
+                                    verts[3 * vid + 2]};
+        mb.normals[3 * fi + k] = {norms[3 * vid], norms[3 * vid + 1],
+                                  norms[3 * vid + 2]};
+        if (has_tc) {
+          mb.sts[3 * fi + k] = {tex[2 * vid], tex[2 * vid + 1]};
+        }
+      }
+    }
+    return true;
+  }
+
+  // Syncs one flex/skin surface: visibility (flags/group/alpha), geometry (Shape
+  // swap gated on the checksum), and material (alpha fade + selection glow).
+  // `build` stages the mesh and checksum; `visible` gates whether it draws at
+  // all; `spec` is the base material spec; `highlighted` whether it carries the
+  // selection glow this frame; `fade` the mjVIS_TRANSPARENT alpha multiplier.
+  template <typename BuildFn>
+  void UpdateOneFlexSkin(const mjModel* m, FlexSkin& fs, bool visible,
+                         bool highlighted, float fade, BuildFn build) {
+    if (!visible) {
+      if (fs.visible) {
+        fs.node->setVisibility(false);
+        fs.visible = false;
+      }
+      return;  // keep the held Shape (hidden); no per-frame cost
+    }
+
+    MeshBuild mb;
+    uint64_t checksum = 0;
+    if (!build(mb, checksum)) {
+      // Visible per the flags but no faces this frame: detach and hide.
+      if (fs.has_shape) SetFlexSkinShape(fs, {}, {});
+      if (fs.visible) {
+        fs.node->setVisibility(false);
+        fs.visible = false;
+      }
+      return;
+    }
+
+    // Effective alpha and the material it selects (fade + glow).
+    float alpha = fs.spec.base_color[3] * fade;
+    const bool blended = alpha < 1.0f;
+    MaterialSpec spec = fs.spec;
+    spec.base_color[3] = alpha;
+    spec.alpha = alpha;
+    const auto kind = blended ? bourbon::SemiTransparencyKind::Blend
+                              : bourbon::SemiTransparencyKind::Opaque;
+    bourbon::RefPtr<bourbon::Material> material =
+        highlighted ? HighlightMaterial(m, spec, blended)
+                    : GetOrCreateMaterial(m, spec, kind);
+
+    const bool geom_changed = !fs.has_shape || checksum != fs.checksum;
+    const bool mat_changed = material.get() != fs.material.get();
+    if (geom_changed) {
+      SetFlexSkinShape(fs, CreateTriangleMeshShape(mb), material);
+      fs.checksum = checksum;
+    } else if (mat_changed) {
+      SetFlexSkinShape(fs, {}, material);  // reuse held shape, new material
+    }
+    fs.blended = blended;
+    fs.highlighted = highlighted;
+    if (blended) any_transparent = true;
+
+    if (!fs.visible) {
+      fs.node->setVisibility(true);
+      fs.visible = true;
+    }
+  }
+
+  // Hides every flex/skin node (keeping its held Shape). Used when the
+  // decoration mjvScene could not be refreshed this frame.
+  void HideAllFlexSkin() {
+    for (FlexSkin& fs : flexes) {
+      if (fs.visible) { fs.node->setVisibility(false); fs.visible = false; }
+    }
+    for (FlexSkin& fs : skins) {
+      if (fs.visible) { fs.node->setVisibility(false); fs.visible = false; }
+    }
+  }
+
+  // Refreshes every flex/skin surface from the decoration mjvScene (already
+  // updated by UpdateDecorations this frame). Must run before the model-graph
+  // evaluation, as a Shape swap mutates graph structure. Selection follows the
+  // Filament priority: a selected body suppresses flex/skin highlight, then a
+  // selected flex suppresses skin highlight.
+  void UpdateFlexSkin(const mjModel* m, const mjvOption* opt,
+                      const mjvPerturb* perturb) {
+    if (!m || !decor_scene_made) return;
+    mjvOption default_opt;
+    if (!opt) {
+      mjv_defaultOption(&default_opt);
+      opt = &default_opt;
+    }
+    const bool transparent = opt->flags[mjVIS_TRANSPARENT] != 0;
+    const float fade = transparent ? static_cast<float>(m->vis.map.alpha) : 1.0f;
+
+    // Selection ids. A flex/skin pick sets flexselect/skinselect AND select (to
+    // the flex vertex's / skin bone's body, via mjv_flexBodyId / the bone body),
+    // so we must NOT gate the flex/skin glow on select being unset -- that body
+    // is incidental (a flex vertex-body has no geoms, so the body glow shows
+    // nothing) and gating on it would suppress the flex/skin highlight entirely.
+    // A single pick sets at most one of flexselect/skinselect, so they don't
+    // conflict; the body highlight (UpdateSelection, on select) runs alongside.
+    const int sel_flex = perturb ? perturb->flexselect : -1;  // >=0 selects
+    const int sel_skin = perturb ? perturb->skinselect : -1;  // >=0 selects
+    highlighted_flex = sel_flex;
+    highlighted_skin = sel_skin;
+
+    // Flex faces exist only when face or smooth-skin rendering is enabled.
+    const bool flex_faces_on =
+        opt->flags[mjVIS_FLEXFACE] || opt->flags[mjVIS_FLEXSKIN];
+    for (int f = 0; f < static_cast<int>(flexes.size()); ++f) {
+      const int grp = m->flex_group[f];
+      const int gc = grp < 0 ? 0 : (grp >= mjNGROUP ? mjNGROUP - 1 : grp);
+      // A surface faded to alpha 0 is not drawn at all (classic skips it).
+      const bool visible = flex_faces_on && opt->flexgroup[gc] &&
+                           flexes[f].spec.base_color[3] * fade > 0.0f;
+      UpdateOneFlexSkin(
+          m, flexes[f], visible, f == sel_flex, fade,
+          [&](MeshBuild& mb, uint64_t& cs) { return BuildFlexMesh(f, mb, cs); });
+    }
+
+    for (int s = 0; s < static_cast<int>(skins.size()); ++s) {
+      const int grp = m->skin_group[s];
+      const int gc = grp < 0 ? 0 : (grp >= mjNGROUP ? mjNGROUP - 1 : grp);
+      const bool visible = opt->flags[mjVIS_SKIN] && opt->skingroup[gc] &&
+                           skins[s].spec.base_color[3] * fade > 0.0f;
+      UpdateOneFlexSkin(
+          m, skins[s], visible, s == sel_skin, fade,
+          [&](MeshBuild& mb, uint64_t& cs) { return BuildSkinMesh(s, mb, cs); });
+    }
   }
 
   // --- Decoration pool -------------------------------------------------------
@@ -3247,6 +3648,19 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
   // structure, so it must precede the model-graph evaluation below.
   s.UpdateDecorations(model, data, perturb, mj_camera, vis_option, extra_geoms,
                       num_extra_geoms);
+
+  // --- Refresh flex/skin surfaces. Reads the deformed, world-space geometry
+  // mjv_updateScene just wrote into the decoration mjvScene (above), so it must
+  // follow UpdateDecorations; it swaps Shapes (mutating graph structure), so it
+  // must precede the model-graph evaluation below. Like decorations, it can
+  // create the first shapes in a flex/skin-only scene, so it runs before the
+  // HasShapes gate. Only reads the mjvScene when UpdateDecorations refreshed it
+  // this frame (same preconditions); otherwise the surfaces are hidden.
+  if (model != nullptr && data != nullptr && mj_camera != nullptr) {
+    s.UpdateFlexSkin(model, vis_option, perturb);
+  } else {
+    s.HideAllFlexSkin();
+  }
 
   // Inject geom labels into the ImGui background draw list, then finalize the
   // ImGui frame. Both must happen before the drawable is composited below.
