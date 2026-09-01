@@ -273,6 +273,22 @@ constexpr float kClassicDirectionalLux = 100000.0f;
 // the directional target so two overlapping spots plus the headlight stay in
 // range under the sunny-16 exposure.
 constexpr float kClassicPunctualCandela = 25000.0f;
+// Headlight illuminance for a classic scene that already has its own lights.
+// Zero, matching Filament's fallback_head_light_intensity_ = 0: a camera-riding
+// headlight at the full directional magnitude doubles the light on every surface
+// the camera faces, over-exposing and desaturating the whole scene under the
+// sunny-16 exposure. A model with no lights of its own still gets a full-strength
+// headlight (see BuildLights) so it is not left black.
+constexpr float kClassicHeadlightLux = 0.0f;
+
+// Exposure compensation (stops) applied on top of the sunny-16 photometric
+// preset. Bourbon computes ev100 = log2(N^2/t) - log2(S/100) - ev_compensation
+// and exposure = 1/(1.2*2^ev100) (Camera.cpp), so a NEGATIVE value darkens.
+// The bare sunny-16 preset over-exposes a classic MuJoCo scene once its key
+// light, spotlight and image-based fill stack up (highlights clip, colours wash
+// toward white), so pull it down about a stop. Live-tunable in the GUI and via
+// the bourbon.evCompensation numeric.
+constexpr float kEvCompensation = -1.0f;
 
 constexpr float kPi = 3.14159265358979323846f;
 
@@ -332,11 +348,18 @@ constexpr float kShadowPenumbraSize = 4.0f;
 // a shadowed surface keeps only ambient/environment fill and reads near-black
 // against directly lit neighbours; letting a fraction of the direct light
 // through lifts the shadow to a plausible grey without washing out the scene.
-constexpr float kShadowIntensity = 0.8f;
+// 0.55 keeps shadows readable but soft, closer to Filament's PCF+SSAO result
+// (SSAO, enabled on the deferred path, supplies the contact darkening instead).
+constexpr float kShadowIntensity = 0.55f;
 
 // Upper bound on the shadow-map edge length. Larger maps give finer edge steps
 // (less pixelation), at 2 bytes/texel: 8192^2 Depth16 is 128 MB per shadow.
 constexpr unsigned kMaxShadowSize = 8192;
+
+// Default SSAO sampling radius, in world units. Sized to typical limb/contact
+// gaps; overridable per-model via the bourbon.ssaoRadius numeric. See the
+// ssao_radius field for how it is wired into the deferred integrator.
+constexpr float kSsaoRadius = 0.12f;
 
 // sRGB electro-optical transfer function (decode to linear).
 float SrgbToLinear(float c) {
@@ -556,10 +579,24 @@ void EffectiveGeomRgba(const mjModel* m, int i, float out[4]) {
 // input bourbon's BXDFClass mapping leaves undriven, so it stays at the
 // MaterialX default of 1). mjTEXROLE_OCCLUSION therefore has no destination.
 
-// MuJoCo's default geom/material specular is 0.5 whereas glTF's default
-// specular weight is 1.0; scaling by two maps one default onto the other, so an
-// unconfigured MuJoCo model gets glTF's standard 4% dielectric F0.
-constexpr float kSpecularToGltf = 2.0f;
+// Global scale from MuJoCo's specular (default 0.5) to a glTF specular weight.
+// Matches the Filament backend's specular_multiplier_ (0.2, model_objects.h):
+// an unconfigured MuJoCo model lands at a 0.1 specular weight, which reads as a
+// matte dielectric rather than the blown-out plastic highlight a weight of 1.0
+// (the old x2 mapping) produced. Lower specular is the single biggest factor in
+// keeping surface colour saturated instead of washed toward white.
+constexpr float kSpecularToGltf = 0.2f;
+
+// Global scale on MuJoCo's shininess before the Blinn-Phong -> GGX roughness
+// conversion, mirroring Filament's shininess_multiplier_ (0.1): it pushes an
+// unconfigured surface much rougher/matter (shininess 0.5 -> roughness ~0.70
+// instead of ~0.44). Only applies to the shininess fallback, never to an
+// explicit mat_roughness.
+constexpr float kShininessMultiplier = 0.1f;
+
+// Global scale on MuJoCo's emission, mirroring Filament's emissive_multiplier_
+// (0.3), so an emissive surface does not bloom under the photometric exposure.
+constexpr float kEmissiveMultiplier = 0.3f;
 
 // Index of refraction. MuJoCo has no equivalent field; 1.5 is glTF's default
 // and the value the Blinn-Phong specular mapping above is calibrated against.
@@ -988,7 +1025,15 @@ float RoughnessFromShininess(float shininess) {
 void ApplyMaterial(MaterialSpec& spec, const mjModel* m, int matid,
                    const float rgba[4], bool allow_textures,
                    const TexGen& texgen) {
-  spec.base_color = {rgba[0], rgba[1], rgba[2], rgba[3]};
+  // MuJoCo authors rgba as sRGB display values (the classic renderer feeds them
+  // straight into a non-gamma-correct GL pipeline). bourbon is a linear PBR
+  // pipeline that sRGB-encodes only at resolve, and glTF's baseColor factor is
+  // linear, so the authored colour must be sRGB-decoded here -- otherwise it
+  // renders pale and under-saturated (green sits too high relative to red, so
+  // a warm 0.8/0.6/0.4 reads as khaki instead of orange). Matches Filament,
+  // which treats its BaseColorFactor as sRGB. Alpha stays linear.
+  spec.base_color = {SrgbToLinear(rgba[0]), SrgbToLinear(rgba[1]),
+                     SrgbToLinear(rgba[2]), rgba[3]};
   spec.alpha = rgba[3];
 
   const float emission =
@@ -1002,15 +1047,20 @@ void ApplyMaterial(MaterialSpec& spec, const mjModel* m, int matid,
   spec.metallic = metallic >= 0.0f ? Clamp01(metallic) : 0.0f;
 
   const float roughness = matid >= 0 ? m->mat_roughness[matid] : -1.0f;
-  spec.roughness = roughness >= 0.0f ? Clamp01(roughness)
-                                     : RoughnessFromShininess(shininess);
+  spec.roughness =
+      roughness >= 0.0f
+          ? Clamp01(roughness)
+          : RoughnessFromShininess(shininess * kShininessMultiplier);
 
   const float s = Clamp01(specular) * kSpecularToGltf;
   spec.specular = {s, s, s, 1.0f};
   spec.ior = kDefaultIor;
-  // MuJoCo's emission is a scalar multiplier on the surface's own colour.
-  spec.emissive = {emission * rgba[0], emission * rgba[1], emission * rgba[2],
-                   0.0f};
+  // MuJoCo's emission is a scalar multiplier on the surface's own colour, scaled
+  // down (kEmissiveMultiplier) to match Filament and avoid blooming. Uses the
+  // already sRGB-decoded base colour.
+  const float em = emission * kEmissiveMultiplier;
+  spec.emissive = {em * spec.base_color[0], em * spec.base_color[1],
+                   em * spec.base_color[2], 0.0f};
 
   if (matid < 0 || !allow_textures) return;
 
@@ -1071,9 +1121,11 @@ void ApplyMaterial(MaterialSpec& spec, const mjModel* m, int matid,
     spec.emissive_map = {ImagePacking::Color, emissive};
     // The emissive map multiplies the emissive uniform, so a material with a
     // map but the default emission of 0 would be black. Use the surface colour
-    // at full strength in that case and let the map carry the variation.
+    // (sRGB-decoded, as base_color) at full strength in that case and let the
+    // map carry the variation.
     if (emission <= 0.0f) {
-      spec.emissive = {rgba[0], rgba[1], rgba[2], 0.0f};
+      spec.emissive = {spec.base_color[0], spec.base_color[1],
+                       spec.base_color[2], 0.0f};
     }
   }
 
@@ -1825,11 +1877,29 @@ struct BourbonContext::Impl {
   enum class RenderPath { Forward, Deferred, DeferredMaterial };
   enum class DrawBackend { IndirectDraws, DrawCommands };
   enum class SemiTransparency { MLAB, WBOIT };
+  // Default to the Forward path. SSAO (bourbon's crevice/contact darkening, a
+  // large part of Filament's look) exists only on the deferred integrators, but
+  // the deferred path currently renders nothing in this integration, so it is
+  // NOT the default; enabling deferred+SSAO needs a separate fix. The GUI combo
+  // / bourbon.renderPath still let a user select it. When a deferred path is
+  // chosen, ssao_radius engages it (see BuildPassGraph).
   RenderPath desired_render_path = RenderPath::Forward;
   DrawBackend desired_draw_backend = DrawBackend::IndirectDraws;
   bool draw_cull = true;
   SemiTransparency desired_semi_transparency = SemiTransparency::MLAB;
   RenderPath built_render_path = RenderPath::Forward;
+
+  // Screen-space ambient-occlusion sampling radius, in world units (bourbon's
+  // SSAOPass takes a world radius; the effect is screen-space, so a fixed radius
+  // works across zoom). ~limb-gap scale. Fed into the integrator at build (a
+  // value > 0 builds the SSAO stage, but only on a deferred path) and pushed
+  // live each frame via Integrator::setSSAORadius. Only the deferred integrators
+  // implement SSAO; the value is ignored on Forward.
+  float ssao_radius = kSsaoRadius;
+
+  // Exposure compensation in stops (negative darkens); pushed into the camera's
+  // photometric exposure each frame by ApplyExposure. See kEvCompensation.
+  float ev_compensation = kEvCompensation;
 
   static bourbon::DrawSubmission::Mode ToMode(DrawBackend backend, bool cull) {
     switch (backend) {
@@ -1964,6 +2034,12 @@ struct BourbonContext::Impl {
         .oit = oit,
         .tap = bourbon::Tap::Color,
         .clustered = false,
+        // A radius > 0 builds the SSAO stage; only the deferred integrators
+        // support it, so the Forward path is fed 0 (no stage). The live radius
+        // is then pushed each frame via Integrator::setSSAORadius. This gate is
+        // structural, keyed by the already-tracked built_render_path.
+        .ssao_radius =
+            desired_render_path != RenderPath::Forward ? ssao_radius : 0.0f,
     };
     // "lit" builds the real integration task; any other surface builds a
     // viz task (ForwardIntegrator.cpp:41). "depth" paints window-space z. The
@@ -2060,7 +2136,7 @@ struct BourbonContext::Impl {
       camera->f_number().setValueIfChanged(16.0f);
       camera->shutter_time().setValueIfChanged(1.0f / 125.0f);
       camera->iso().setValueIfChanged(100.0f);
-      camera->ev_compensation().setValueIfChanged(0.0f);
+      camera->ev_compensation().setValueIfChanged(ev_compensation);
     }
   }
 
@@ -2703,7 +2779,11 @@ struct BourbonContext::Impl {
       L.is_headlight = true;
       L.kind = bourbon::SGObjectKind::DistantLight;
       L.intensity_unit = Unit::Lux;
-      L.intensity_value = kClassicDirectionalLux;
+      // Zero the headlight when the model brings its own lights (avoids the ~2x
+      // over-exposure of double lighting), but keep a full-strength headlight for
+      // a light-less model so it is not left black. Matches Filament.
+      L.intensity_value =
+          m->nlight > 0 ? kClassicHeadlightLux : kClassicDirectionalLux;
       L.source = bourbon::DistantLight::Create(
           {.intensity = {L.intensity_value, L.intensity_unit}}, h, g, sg);
       AttachLight(L);
@@ -3742,7 +3822,7 @@ BourbonContext::BourbonContext(void* metal_layer)
           .f_number = 16.0f,
           .shutter_time = 1.0f / 125.0f,
           .iso = 100.0f,
-          .ev_compensation = 0.0f,
+          .ev_compensation = kEvCompensation,
       },
       *s.model_heap, *s.model_graph, *s.sg_context);
   s.world->model().setViewCamera(s.camera.get());
@@ -3802,6 +3882,14 @@ void BourbonContext::Init(const mjModel* model) {
           static_cast<int>(model->numeric_data[model->numeric_adr[id]]);
       return (v < lo || v > hi) ? fallback : v;
     };
+    auto read_float = [&](const char* name, float lo, float hi,
+                          float fallback) -> float {
+      const int id = mj_name2id(model, mjOBJ_NUMERIC, name);
+      if (id < 0 || model->numeric_size[id] < 1) return fallback;
+      const float v =
+          static_cast<float>(model->numeric_data[model->numeric_adr[id]]);
+      return (v < lo || v > hi) ? fallback : v;
+    };
     Impl& s = *impl_;
     s.desired_render_path = static_cast<Impl::RenderPath>(
         read_int("bourbon.renderPath", 0, 2,
@@ -3813,6 +3901,12 @@ void BourbonContext::Init(const mjModel* model) {
     s.desired_semi_transparency = static_cast<Impl::SemiTransparency>(
         read_int("bourbon.oit", 0, 1,
                  static_cast<int>(s.desired_semi_transparency)));
+    // SSAO sampling radius in world units (0 disables SSAO even on a deferred
+    // path). Upper bound is generous; the effect saturates well before it.
+    s.ssao_radius = read_float("bourbon.ssaoRadius", 0.0f, 100.0f, s.ssao_radius);
+    // Exposure compensation in stops (negative darkens).
+    s.ev_compensation =
+        read_float("bourbon.evCompensation", -10.0f, 10.0f, s.ev_compensation);
   }
 }
 
@@ -4018,6 +4112,9 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     }
     s.clear_task->extent_in().setValue(extent);
     s.integrator->setExtent(extent);
+    // Live SSAO radius (deferred paths only; a no-op on Forward, whose SSAO
+    // stage was never built).
+    s.integrator->setSSAORadius(s.ssao_radius);
 
     s.render_heap->free();
     s.render_heap->allocate();
@@ -4140,6 +4237,13 @@ void BourbonContext::DrawOptionsGui() {
       ImGui::EndCombo();
     }
   }
+
+  // Exposure compensation (stops). Negative darkens; applied live via
+  // ApplyExposure (the camera's ev_compensation is a DGInput, no rebuild).
+  ImGui::SliderFloat("Exposure (EV)", &s.ev_compensation, -4.0f, 4.0f, "%.2f");
+
+  // SSAO sampling radius (world units); only affects the deferred paths.
+  ImGui::SliderFloat("SSAO radius", &s.ssao_radius, 0.0f, 1.0f, "%.3f");
 }
 
 }  // namespace mujoco::render_bourbon
