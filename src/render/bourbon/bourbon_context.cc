@@ -1877,13 +1877,12 @@ struct BourbonContext::Impl {
   enum class RenderPath { Forward, Deferred, DeferredMaterial };
   enum class DrawBackend { IndirectDraws, DrawCommands };
   enum class SemiTransparency { MLAB, WBOIT };
-  // Default to the Forward path. SSAO (bourbon's crevice/contact darkening, a
-  // large part of Filament's look) exists only on the deferred integrators, but
-  // the deferred path currently renders nothing in this integration, so it is
-  // NOT the default; enabling deferred+SSAO needs a separate fix. The GUI combo
-  // / bourbon.renderPath still let a user select it. When a deferred path is
-  // chosen, ssao_radius engages it (see BuildPassGraph).
-  RenderPath desired_render_path = RenderPath::Forward;
+  // Default to the Deferred path so SSAO runs: bourbon's SSAOPass exists only on
+  // the deferred integrators, and its crevice/contact darkening is a large part
+  // of Filament's grounded look. ssao_radius (> 0) engages the stage in
+  // BuildPassGraph. The GUI combo / bourbon.renderPath still let a user pick
+  // Forward (which then runs without SSAO).
+  RenderPath desired_render_path = RenderPath::Deferred;
   DrawBackend desired_draw_backend = DrawBackend::IndirectDraws;
   bool draw_cull = true;
   SemiTransparency desired_semi_transparency = SemiTransparency::MLAB;
