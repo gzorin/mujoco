@@ -248,6 +248,10 @@ struct Light {
   float shadow_far = 100.0f;
   float shadow_coverage = 1.0f;  // directional ortho half-extent (width=height=2x)
   float shadow_coneangle = 180.0f;  // spot shadow full cone angle (degrees)
+  // Depth-comparison bias, in bourbon's normalized-distance units (a fraction of
+  // far-near). Computed from a fixed world-space offset and the fitted frustum
+  // span so it stays physical regardless of scene size; see BuildLights.
+  Eigen::Array2f shadow_bias = {0.005f, 0.05f};
 };
 
 // Classic-scene fallback illumination (used when a model authors no physical
@@ -304,6 +308,32 @@ constexpr float kSkyboxIrradianceFraction = 0.15f;
 // synthesized gradient. Below 1 so the fill keeps an up/down cue rather than
 // flattening the model the way a uniform ambient does.
 constexpr float kEnvGroundFraction = 0.3f;
+
+// Neutral ambient fill (as an effective [0,1] grey ambient coefficient) used
+// when a model authors no ambient and carries no skybox. Without it, a point
+// occluded from every punctual light receives zero radiance and reads as pure
+// black -- the shadows looked correct in shape but crushed. The Filament
+// backend never has this problem because it always attaches a fallback
+// environment light (~5000 lux; model_lights.cc). 0.05 * kClassicDirectionalLux
+// = 5000 lux matches that, so classic skybox-less scenes get the same soft fill.
+constexpr float kClassicAmbientFraction = 0.05f;
+
+// PCSS penumbra size (in shadow-map texels) for soft shadow edges. bourbon's
+// PCSS estimates a blocker ratio and widens the PCF kernel from this (search
+// clamped to 4, kernel to 6 -> up to 13x13 texels), so 4 is the largest value
+// that still changes the result; without it the fitted, high-resolution shadow
+// map produces razor-hard, aliased edges.
+constexpr float kShadowPenumbraSize = 4.0f;
+
+// How much of a light a shadow removes (bourbon ShadowSource intensity). At 1.0
+// a shadowed surface keeps only ambient/environment fill and reads near-black
+// against directly lit neighbours; letting a fraction of the direct light
+// through lifts the shadow to a plausible grey without washing out the scene.
+constexpr float kShadowIntensity = 0.8f;
+
+// Upper bound on the shadow-map edge length. Larger maps give finer edge steps
+// (less pixelation), at 2 bytes/texel: 8192^2 Depth16 is 128 MB per shadow.
+constexpr unsigned kMaxShadowSize = 8192;
 
 // sRGB electro-optical transfer function (decode to linear).
 float SrgbToLinear(float c) {
@@ -2451,16 +2481,29 @@ struct BourbonContext::Impl {
     const bool classic = total_intensity <= 0.0f;
 
     // Shadow projection parameters (baked into each ShadowSource at creation --
-    // they are not DGInputs). Mirrors the classic/prior renderer: the shadow-map
-    // near/far track the model's camera clip range, the directional ortho half-
-    // extent is shadowclip*extent, and the spot shadow FOV is
-    // 2*cutoff*shadowscale. Shadow-map size is clamped to a safe cap.
+    // they are not DGInputs). Unlike the classic renderer -- whose shadow map is
+    // a 24-bit reverse-Z depth buffer biased with glPolygonOffset (self-scaling
+    // depth-buffer units) -- bourbon's shadow map stores *linear normalized
+    // distance* over [near, far] and applies its bias as a *fraction of
+    // (far - near)* (ShadowPass.metal, ShadowSourceUtil.metal::shadow_depth). So
+    // reusing the classic camera clip range (extent*[znear, zfar], a span of
+    // ~50*extent) turns the default 0.005..0.05 bias into a world offset of
+    // 0.25..2.5 scene-widths, shoving every contact shadow off its caster. The
+    // frustum must instead bracket the scene tightly: we fit it to the scene
+    // bounding sphere and derive the bias from a fixed world-space offset.
+    //
+    // stat.extent is the largest bounding-box side, so a sphere of radius
+    // 0.5*sqrt(3)*extent (~0.866) contains the whole box.
     const float extent = std::max(static_cast<float>(m->stat.extent), 1e-3f);
-    const float shadow_near = extent * static_cast<float>(m->vis.map.znear);
-    const float shadow_far = extent * static_cast<float>(m->vis.map.zfar);
-    const float shadow_coverage = extent * static_cast<float>(m->vis.map.shadowclip);
-    const unsigned shadow_size =
-        static_cast<unsigned>(std::min(m->vis.quality.shadowsize, 4096));
+    const Eigen::Vector3f scene_center(static_cast<float>(m->stat.center[0]),
+                                       static_cast<float>(m->stat.center[1]),
+                                       static_cast<float>(m->stat.center[2]));
+    const float scene_radius = 0.866f * extent;
+    // Target world-space shadow bias (constant term and grazing-angle slope).
+    const float world_bias_const = 0.0015f * extent;
+    const float world_bias_slope = 0.01f * extent;
+    const unsigned shadow_size = static_cast<unsigned>(
+        std::min<int>(m->vis.quality.shadowsize, kMaxShadowSize));
     const float shadowscale = static_cast<float>(m->vis.map.shadowscale);
 
     using Unit = bourbon::LightSource::Intensity::Unit;
@@ -2533,10 +2576,48 @@ struct BourbonContext::Impl {
       }
       L.casts_shadow = m->light_castshadow[i] != 0;
       L.shadow_size = shadow_size;
-      L.shadow_near = shadow_near;
-      L.shadow_far = shadow_far;
-      L.shadow_coverage = shadow_coverage;
-      L.shadow_coneangle = 2.0f * m->light_cutoff[i] * shadowscale;
+      // Fit near/far to the scene bounding sphere along the light's view of it.
+      // These are baked from the light's model-frame placement (light_pos/
+      // light_dir at qpos0); a light that later moves far relative to the scene
+      // would want a rebuild via the shadow structural key, but a static light
+      // -- the common case -- stays tight.
+      const Eigen::Vector3f lp(static_cast<float>(m->light_pos[3 * i + 0]),
+                               static_cast<float>(m->light_pos[3 * i + 1]),
+                               static_cast<float>(m->light_pos[3 * i + 2]));
+      L.shadow_coverage = scene_radius;  // directional ortho half-extent
+      L.shadow_coneangle = 2.0f * m->light_cutoff[i] * shadowscale;  // spot only
+      if (m->light_type[i] == mjLIGHT_DIRECTIONAL) {
+        // Ortho box centred on the light node, measured along the light axis.
+        Eigen::Vector3f ld(static_cast<float>(m->light_dir[3 * i + 0]),
+                           static_cast<float>(m->light_dir[3 * i + 1]),
+                           static_cast<float>(m->light_dir[3 * i + 2]));
+        if (ld.squaredNorm() > 1e-12f) ld.normalize();
+        const float dz = (scene_center - lp).dot(ld);
+        L.shadow_near = std::max(dz - scene_radius, 1e-3f * extent);
+        L.shadow_far = std::max(dz + scene_radius, L.shadow_near + 1e-3f * extent);
+      } else {
+        // Perspective (spot) / cube (point): distance from the light position.
+        const float d = (lp - scene_center).norm();
+        L.shadow_near = std::max(d - scene_radius, 1e-3f * extent);
+        L.shadow_far = std::max(d + scene_radius, L.shadow_near + 1e-3f * extent);
+        // Widen the shadow cone to just contain the scene bounding sphere, but
+        // never past the light's own illumination cone (nothing outside it is
+        // lit, so nothing there needs shadowing). A blind cutoff*shadowscale is
+        // too narrow for a light close to / above the model -- e.g. humanoid's
+        // overhead "top" light -- so the body's extent spills outside the shadow
+        // map (which reads as lit) and only the distant, low-angle spotlight
+        // seems to cast, making shadows look like they come from the side.
+        const float cutoff = static_cast<float>(m->light_cutoff[i]);
+        const float need_half_deg =
+            (scene_radius >= d) ? 90.0f
+                                : std::asin(scene_radius / d) * 180.0f / kPi;
+        const float half_deg =
+            std::min(cutoff, std::max(cutoff * shadowscale, need_half_deg));
+        L.shadow_coneangle = 2.0f * half_deg;
+      }
+      // Convert the target world bias to bourbon's normalized-distance units.
+      const float span = L.shadow_far - L.shadow_near;
+      L.shadow_bias = {world_bias_const / span, world_bias_slope / span};
       AttachLight(L);
       lights.push_back(std::move(L));
     }
@@ -2624,7 +2705,13 @@ struct BourbonContext::Impl {
                                   m->light_ambient[3 * i + 1],
                                   m->light_ambient[3 * i + 2]);
       }
-      if (ambient.maxCoeff() <= 0.0f) return;  // nothing to contribute
+      // No authored ambient: substitute a neutral fill so shadowed surfaces are
+      // not pure black, matching Filament's always-on fallback environment. A
+      // model that deliberately wants a black void can still get one by not
+      // casting shadows; here the fill is what makes shadows read as grey.
+      if (ambient.maxCoeff() <= 0.0f) {
+        ambient = Eigen::Array3f::Constant(kClassicAmbientFraction);
+      }
       // Tint by the haze colour, which is what MuJoCo authors reach for to
       // colour the air; it defaults to white, so this is a no-op by default.
       const Eigen::Array3f haze(m->vis.rgba.haze[0], m->vis.rgba.haze[1],
@@ -2736,26 +2823,36 @@ struct BourbonContext::Impl {
         L.shadow = bourbon::DirectionalShadow::Create(
             bourbon::DirectionalShadow::DistantParams{
                 .size = L.shadow_size,
+                .intensity = kShadowIntensity,
                 .width = 2.0f * L.shadow_coverage,
                 .height = 2.0f * L.shadow_coverage,
                 .near = L.shadow_near,
-                .far = L.shadow_far},
+                .far = L.shadow_far,
+                .filter = bourbon::ShadowFilter::PCSS,
+                .penumbra_size = kShadowPenumbraSize,
+                .bias = L.shadow_bias},
             h, g, sg);
         break;
       case bourbon::SGObjectKind::SpotLight:
         L.shadow = bourbon::DirectionalShadow::Create(
             bourbon::DirectionalShadow::SpotParams{
                 .size = L.shadow_size,
+                .intensity = kShadowIntensity,
                 .coneangle = L.shadow_coneangle,
                 .near = L.shadow_near,
-                .far = L.shadow_far},
+                .far = L.shadow_far,
+                .filter = bourbon::ShadowFilter::PCSS,
+                .penumbra_size = kShadowPenumbraSize,
+                .bias = L.shadow_bias},
             h, g, sg);
         break;
       case bourbon::SGObjectKind::PointLight:
         L.shadow = bourbon::CubeShadow::Create(
             bourbon::CubeShadow::Params{.size = L.shadow_size,
+                                        .intensity = kShadowIntensity,
                                         .near = L.shadow_near,
-                                        .far = L.shadow_far},
+                                        .far = L.shadow_far,
+                                        .bias = L.shadow_bias},
             h, g, sg);
         break;
       default:
