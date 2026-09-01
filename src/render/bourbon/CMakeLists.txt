@@ -34,23 +34,11 @@ target_include_directories(render_bourbon
     ${PROJECT_SOURCE_DIR}/src
 )
 
-# Locate the bourbon install prefix from an imported target's on-disk location,
-# config-agnostically (a Debug-only install sets IMPORTED_LOCATION_DEBUG, not
-# _RELEASE), so this works whether bourbon was installed Debug or Release.
-get_target_property(_bourbon_cfgs Bourbon::BourbonCore IMPORTED_CONFIGURATIONS)
-set(_bourbon_core_loc "")
-if(_bourbon_cfgs)
-  list(GET _bourbon_cfgs 0 _bourbon_cfg0)
-  get_target_property(_bourbon_core_loc Bourbon::BourbonCore
-                      IMPORTED_LOCATION_${_bourbon_cfg0})
-endif()
-if(NOT _bourbon_core_loc)
-  get_target_property(_bourbon_core_loc Bourbon::BourbonCore IMPORTED_LOCATION)
-endif()
-if(NOT _bourbon_core_loc)
-  message(FATAL_ERROR "render_bourbon: could not resolve Bourbon::BourbonCore "
-                      "imported location (configs: ${_bourbon_cfgs}).")
-endif()
+# Locate the bourbon install prefix from an imported target's on-disk location.
+# The resolution is config-agnostic (a Debug-only install sets
+# IMPORTED_LOCATION_DEBUG, not _RELEASE) and shared with the .app bundle
+# assembly, which needs the same paths to embed these dylibs.
+mujoco_bourbon_imported_location(Bourbon::BourbonCore _bourbon_core_loc)
 get_filename_component(_bourbon_libdir "${_bourbon_core_loc}" DIRECTORY)
 get_filename_component(_bourbon_prefix "${_bourbon_libdir}/.." ABSOLUTE)
 
@@ -132,15 +120,28 @@ target_link_libraries(render_bourbon
 )
 
 # Runtime path to the Metal toolchain for llair::setPathToTools, discovered by
-# the root CMakeLists.txt. Overridable at runtime via the MUJOCO_BOURBON_LLAIR_TOOLS
-# environment variable.
+# the root CMakeLists.txt. This is only a fast path: bourbon_context.cc checks
+# that it still contains 'metal' and falls back to xcrun otherwise, because on
+# recent macOS the toolchain lives on a cryptex mount whose path changes per
+# mount. Overridable at configure time here, and at runtime via the
+# MUJOCO_BOURBON_LLAIR_TOOLS environment variable.
+set(MUJOCO_BOURBON_LLAIR_TOOLS_PATH "${MUJOCO_METAL_TOOLS_PATH}" CACHE PATH
+    "Directory containing the Metal toolchain ('metal', 'metallib', ...) baked \
+into render_bourbon as a fast path for llair::setPathToTools.")
 target_compile_definitions(render_bourbon PRIVATE
-  MUJOCO_BOURBON_LLAIR_TOOLS_PATH="${MUJOCO_METAL_TOOLS_PATH}")
+  MUJOCO_BOURBON_LLAIR_TOOLS_PATH="${MUJOCO_BOURBON_LLAIR_TOOLS_PATH}")
 
 # The bourbon libraries are imported SHARED targets linked as @rpath/... . Add
 # their install directory (resolved above) to the runtime search path of any
 # executable that links this library (propagated as an INTERFACE link option
 # through the static platform library to the studio executable).
-target_link_options(render_bourbon INTERFACE "-Wl,-rpath,${_bourbon_libdir}")
+#
+# Deliberately NOT added for a .app bundle build: an absolute fallback would let
+# a bundle that failed to embed one of the dylibs still resolve it from the
+# local bourbon install and appear to work on this machine only -- exactly the
+# failure the bundle exists to prevent.
+if(NOT MUJOCO_STUDIO_MACOS_BUNDLE)
+  target_link_options(render_bourbon INTERFACE "-Wl,-rpath,${_bourbon_libdir}")
+endif()
 
 add_library(mujoco::render_bourbon ALIAS render_bourbon)

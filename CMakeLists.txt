@@ -51,6 +51,11 @@ if(NOT EMSCRIPTEN)
   option(MUJOCO_USE_FILAMENT_MJR_COMPAT "Use filament mjr compatibility layer" OFF)
   if(APPLE)
     option(MUJOCO_USE_BOURBON "Use the Bourbon Metal renderer (macOS only)" OFF)
+    # Build mujoco_studio as a relocatable "MuJoCo Studio.app". Orthogonal to
+    # MUJOCO_BUILD_MACOS_FRAMEWORKS, which governs libmujoco's layout.
+    option(MUJOCO_STUDIO_MACOS_BUNDLE "Build mujoco_studio as a macOS .app bundle"
+           ${MUJOCO_BUILD_STUDIO})
+    include(MujocoStudioBundle)
   endif()
 endif()
 

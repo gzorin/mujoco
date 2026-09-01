@@ -137,7 +137,106 @@ if(NOT EMSCRIPTEN)
         launcher.h
         ${STUDIO_RESOURCE_FILES}
     )
-    if(APPLE AND MUJOCO_BUILD_MACOS_FRAMEWORKS)
+
+    if(APPLE AND MUJOCO_STUDIO_MACOS_BUNDLE)
+        # --- Info.plist substitution values -------------------------------------
+        #
+        # Git state is captured at configure time, so it goes stale until the next
+        # re-configure. That is the right trade for a dev-facing app: these keys
+        # exist to make a bug report unambiguous, not to gate anything.
+        execute_process(
+            COMMAND git rev-parse --short HEAD
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            OUTPUT_VARIABLE MUJOCO_STUDIO_GIT_REVISION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT MUJOCO_STUDIO_GIT_REVISION)
+            set(MUJOCO_STUDIO_GIT_REVISION "unknown")
+        else()
+            execute_process(
+                COMMAND git status --porcelain --untracked-files=no
+                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+                OUTPUT_VARIABLE _studio_git_dirty
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(_studio_git_dirty)
+                set(MUJOCO_STUDIO_GIT_REVISION "${MUJOCO_STUDIO_GIT_REVISION}-dirty")
+            endif()
+        endif()
+
+        # CFBundleVersion must be monotonic -- that is what macOS compares for
+        # launch-services and update purposes -- so it is derived from the commit
+        # count rather than from the SHA.
+        execute_process(
+            COMMAND git rev-list --count HEAD
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            OUTPUT_VARIABLE MUJOCO_STUDIO_BUILD_NUMBER
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT MUJOCO_STUDIO_BUILD_NUMBER)
+            set(MUJOCO_STUDIO_BUILD_NUMBER "0")
+        endif()
+
+        set(MUJOCO_STUDIO_BOURBON_REVISION "none")
+        if(MUJOCO_USE_BOURBON)
+            file(READ "${PROJECT_SOURCE_DIR}/src/render/bourbon/BOURBON_VERSION"
+                 _bourbon_version_text)
+            if(_bourbon_version_text MATCHES "bourbon git SHA: ([0-9a-f]+)")
+                set(MUJOCO_STUDIO_BOURBON_REVISION "${CMAKE_MATCH_1}")
+            endif()
+        endif()
+
+        set(MUJOCO_STUDIO_RENDER_BACKENDS "classic")
+        if(MUJOCO_USE_FILAMENT)
+            set(MUJOCO_STUDIO_RENDER_BACKENDS
+                "${MUJOCO_STUDIO_RENDER_BACKENDS}, filament")
+        endif()
+        if(MUJOCO_USE_BOURBON)
+            set(MUJOCO_STUDIO_RENDER_BACKENDS
+                "${MUJOCO_STUDIO_RENDER_BACKENDS}, bourbon")
+        endif()
+
+        # CMAKE_OSX_DEPLOYMENT_TARGET is normally unset here: MujocoMacOS.cmake
+        # passes -mmacosx-version-min directly so as not to affect SDK choice.
+        set(MUJOCO_STUDIO_MIN_MACOS "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        if(NOT MUJOCO_STUDIO_MIN_MACOS)
+            set(MUJOCO_STUDIO_MIN_MACOS "${MUJOCO_MACOSX_VERSION_MIN}.0")
+        endif()
+
+        # --- bundle properties ---------------------------------------------------
+        #
+        # MACOSX_BUNDLE must be set BEFORE configure_studio_target() below, which
+        # reads the property to decide whether fonts are staged into
+        # Contents/Resources/assets or into bin/assets.
+        set(_studio_install_rpath "@executable_path/../Frameworks")
+        if(MUJOCO_BUILD_MACOS_FRAMEWORKS)
+            # Keep the framework build's extra entry; the two options are orthogonal.
+            list(APPEND _studio_install_rpath "@executable_path/../../..")
+        endif()
+
+        set_target_properties(mujoco_studio PROPERTIES
+            MACOSX_BUNDLE TRUE
+            OUTPUT_NAME "MuJoCo Studio"
+            MACOSX_BUNDLE_INFO_PLIST "${PROJECT_SOURCE_DIR}/dist/Info.plist.studio.in"
+            MACOSX_BUNDLE_BUNDLE_NAME "MuJoCo Studio"
+            MACOSX_BUNDLE_GUI_IDENTIFIER "org.mujoco.studio"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_BUNDLE_VERSION
+                "${PROJECT_VERSION}.${MUJOCO_STUDIO_BUILD_NUMBER}"
+            MACOSX_BUNDLE_LONG_VERSION_STRING
+                "${PROJECT_VERSION} (${MUJOCO_STUDIO_GIT_REVISION})"
+            MACOSX_BUNDLE_INFO_STRING
+                "${PROJECT_VERSION} (${MUJOCO_STUDIO_GIT_REVISION})"
+            MACOSX_BUNDLE_ICON_FILE "mujoco_studio.icns"
+            MACOSX_BUNDLE_COPYRIGHT
+                "Copyright 2026 DeepMind Technologies Limited."
+            RESOURCE "${STUDIO_RESOURCE_FILES}"
+            INSTALL_RPATH "${_studio_install_rpath}"
+            BUILD_WITH_INSTALL_RPATH TRUE
+        )
+    elseif(APPLE AND MUJOCO_BUILD_MACOS_FRAMEWORKS)
+        # Bundling was explicitly disabled, so fall back to the bare bundle the
+        # framework layout has always produced (nothing is embedded into it).
         set_target_properties(mujoco_studio PROPERTIES
             MACOSX_BUNDLE TRUE
             INSTALL_RPATH "@executable_path/../Frameworks;@executable_path/../../.."
@@ -157,7 +256,18 @@ if(NOT EMSCRIPTEN)
         )
     endif()
     configure_studio_target(mujoco_studio)
-    if(NOT (APPLE AND MUJOCO_BUILD_MACOS_FRAMEWORKS))
+
+    # Stage libmujoco, the bourbon dylibs and the engine plugins into the .app,
+    # then re-sign it. POST_BUILD (not install-time) so the bundle launched out
+    # of the build tree is the same artifact that ships.
+    if(APPLE AND MUJOCO_STUDIO_MACOS_BUNDLE)
+        mujoco_studio_assemble_bundle(mujoco_studio)
+        mujoco_studio_add_dmg_target(mujoco_studio)
+    endif()
+
+    # A bundle manages its own rpath (BUILD_WITH_INSTALL_RPATH above); appending
+    # the install lib dir would reintroduce an absolute path into the .app.
+    if(NOT (APPLE AND (MUJOCO_BUILD_MACOS_FRAMEWORKS OR MUJOCO_STUDIO_MACOS_BUNDLE)))
         include(TargetAddRpath)
         target_add_rpath(
           TARGETS

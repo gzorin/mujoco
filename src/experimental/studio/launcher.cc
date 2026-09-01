@@ -14,23 +14,64 @@
 
 #include "experimental/studio/launcher.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <string>
 #include <string_view>
 
 #include <mujoco/mujoco.h>
 #include "experimental/platform/hal/graphics_mode.h"
 #include "experimental/platform/resources.h"
+#include "experimental/platform/sys_utils.h"
 #include "experimental/studio/app.h"
 
 namespace mujoco::studio {
+
+namespace {
+
+// Loads the engine plugins (elasticity, actuator, sensor, sdf) shipped
+// alongside the executable. Without this, any model referencing one of them
+// fails to load. Probes the bundle layout first, then the flat build-tree
+// layout -- the same shape as the asset lookup in platform/resources.cc.
+void LoadBundledPlugins() {
+  const std::filesystem::path module_dir =
+      mujoco::platform::GetModuleDir((void*)&LoadBundledPlugins);
+  if (module_dir.empty()) {
+    return;
+  }
+
+  const std::filesystem::path candidates[] = {
+      module_dir.parent_path() / "PlugIns" / "mujoco_plugin",
+      module_dir / "mujoco_plugin",
+  };
+
+  for (const std::filesystem::path& dir : candidates) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+      continue;
+    }
+    mj_loadAllPluginLibraries(
+        dir.string().c_str(),
+        +[](const char* filename, int first, int count) {
+          std::printf("Plugins registered by library '%s':\n", filename);
+          for (int i = first; i < first + count; ++i) {
+            std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
+          }
+        });
+    return;
+  }
+}
+
+}  // namespace
 
 int LaunchStudio(int argc, char** argv, LauncherConfig config) {
   const char* home = std::getenv("HOME");
   const std::string ini_path = std::string(home ? home : ".") + "/.mujoco.ini";
 
   mujoco::platform::RegisterResourceProviders();
+  LoadBundledPlugins();
 
   if (config.gfx_mode.empty()) {
     const char* display = std::getenv("DISPLAY");
@@ -53,7 +94,13 @@ int LaunchStudio(int argc, char** argv, LauncherConfig config) {
     }
   }
 
-#if defined(MUJOCO_USE_FILAMENT)
+  // A Finder-launched .app gets no --gfx, so the default is what a
+  // double-click actually starts. Bourbon comes first on macOS: without this,
+  // the bundle would silently fall back to the classic OpenGL renderer.
+#if defined(MUJOCO_USE_BOURBON)
+  const mujoco::platform::GraphicsMode default_mode =
+      mujoco::platform::GraphicsMode::BourbonMetal;
+#elif defined(MUJOCO_USE_FILAMENT)
   const mujoco::platform::GraphicsMode default_mode =
       mujoco::platform::GraphicsMode::FilamentOpenGl;
 #else

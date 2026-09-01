@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstring>
 #include <string>
+#include <vector>
 
 #include <absl/flags/flag.h>
 #include <absl/flags/parse.h>
@@ -24,6 +26,21 @@ ABSL_FLAG(std::string, model_file, "", "MuJoCo model file.");
 ABSL_FLAG(std::string, gfx, "", "Graphics API");
 
 int main(int argc, char** argv) {
+  // Launching a .app from Finder can append a "-psn_<x>_<y>" process serial
+  // number argument. absl::ParseCommandLine treats an unrecognised flag as
+  // fatal, so drop it before parsing.
+  std::vector<char*> args;
+  args.reserve(argc + 1);
+  for (int i = 0; i < argc; ++i) {
+    if (i > 0 && std::strncmp(argv[i], "-psn_", 5) == 0) {
+      continue;
+    }
+    args.push_back(argv[i]);
+  }
+  args.push_back(nullptr);
+  argc = static_cast<int>(args.size()) - 1;
+  argv = args.data();
+
   absl::ParseCommandLine(argc, argv);
 
   std::string model_file = absl::GetFlag(FLAGS_model_file);
