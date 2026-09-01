@@ -63,6 +63,11 @@ class Renderer {
   // presenting a control that silently does nothing. Defaults to "supported".
   virtual bool SupportsRenderFlag(int flag) const { return true; }
 
+  // Lets a backend draw its own ImGui controls in the "Rendering" panel (called
+  // inside that section each frame). Most backends have no extra options, so the
+  // default draws nothing.
+  virtual void DrawOptionsGui() {}
+
   // Returns the current frame rate.
   virtual double GetFps() = 0;
 };

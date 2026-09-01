@@ -55,6 +55,8 @@ class BourbonRenderer : public Renderer {
 
   bool SupportsRenderFlag(int flag) const override;
 
+  void DrawOptionsGui() override;
+
   double GetFps() override;
 
  private:

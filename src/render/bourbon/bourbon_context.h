@@ -65,6 +65,12 @@ class BourbonContext {
                    const mjtByte* render_flags, const mjvGeom* extra_geoms,
                    int num_extra_geoms);
 
+  // Draws the bourbon-specific render-option controls (render path, draw
+  // submission mode, transparency technique) into the current ImGui frame. The
+  // caller must be inside an ImGui window/section. Selections take effect on the
+  // next RenderFrame via a pass-graph rebuild.
+  void DrawOptionsGui();
+
   // Frames-per-second, exponentially smoothed.
   double GetFps() const;
 

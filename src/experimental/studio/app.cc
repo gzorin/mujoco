@@ -1394,6 +1394,10 @@ void App::ModelOptionsGui() {
 
     platform::RenderingGui(model(), &vis_options_, renderer_->GetRenderFlags(),
                            renderer_.get(), min_width);
+
+    // Backend-specific render options (e.g. the Bourbon render path / draw mode /
+    // transparency dropdowns). No-op for backends that expose none.
+    renderer_->DrawOptionsGui();
     ImGui::TreePop();
   }
   ImGui::EndChild();

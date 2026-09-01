@@ -97,8 +97,11 @@
 #include <BourbonRenderer/World/World.h>
 #include <BourbonRenderer/Integrators/Integrator.h>
 #include <BourbonRenderer/Integrators/ForwardIntegrator.h>
+#include <BourbonRenderer/Integrators/DeferredIntegrator.h>
+#include <BourbonRenderer/Integrators/DeferredMaterialIntegrator.h>
 #include <BourbonRenderer/Passes/ClearFramebufferPass.h>
 #include <BourbonRenderer/Passes/ForwardVizPass.h>
+#include <BourbonRenderer/Passes/GBufferVizPass.h>
 #include <BourbonRenderer/Passes/ResolvePass.h>
 
 #include <mujoco/mujoco.h>
@@ -1764,7 +1767,11 @@ struct BourbonContext::Impl {
   // Forward pass graph: clear -> integrate -> resolve into the drawable.
   std::unique_ptr<DrawableImageSource> drawable_source;
   std::unique_ptr<bourbon::ClearFramebufferTask> clear_task;
-  std::unique_ptr<bourbon::ForwardIntegrator> integrator;
+  // Base-class pointer: the concrete integrator (Forward/Deferred/
+  // DeferredMaterial) is chosen per build from `desired_render_path`. Every
+  // per-frame call the plugin makes (setExtent/setDepthRange/output) is on the
+  // base.
+  std::unique_ptr<bourbon::Integrator> integrator;
   std::unique_ptr<bourbon::ResolveTask> resolve_task;
   bourbon::Timestamp prior_render_signal{};
 
@@ -1800,6 +1807,41 @@ struct BourbonContext::Impl {
   // exposure the ResolvePass applies would crush it to black.
   bool viz_depth = false;
   bool built_viz_depth = false;
+
+  // --- User-selectable render options (studio "Rendering" panel + MJCF
+  // `bourbon.*` numeric defaults). Each is fed into the structural pass-graph
+  // key, so changing one triggers a single RebuildPassGraph (one blocking
+  // fence, the same hitch as toggling shadows). Defaults reproduce the previous
+  // hard-coded behaviour: Forward path, IndirectDraws + cull, MLAB.
+  //
+  // The render path selects the concrete integrator built in BuildPassGraph
+  // (captured at construction, hence structural). `built_render_path` is the
+  // key's memo of the last build. The draw back-end + cull combine into a
+  // DrawSubmission::Mode via ToMode(); Mode is already in the key as
+  // `built_mode`. The transparency technique only chooses which OITKind is fed
+  // when the scene is (or could be) translucent -- OIT is still auto-gated off
+  // for a fully opaque scene, so an idle scene pays nothing -- and WBOIT vs MLAB
+  // is already distinguished by the `built_oit` key field.
+  enum class RenderPath { Forward, Deferred, DeferredMaterial };
+  enum class DrawBackend { IndirectDraws, DrawCommands };
+  enum class SemiTransparency { MLAB, WBOIT };
+  RenderPath desired_render_path = RenderPath::Forward;
+  DrawBackend desired_draw_backend = DrawBackend::IndirectDraws;
+  bool draw_cull = true;
+  SemiTransparency desired_semi_transparency = SemiTransparency::MLAB;
+  RenderPath built_render_path = RenderPath::Forward;
+
+  static bourbon::DrawSubmission::Mode ToMode(DrawBackend backend, bool cull) {
+    switch (backend) {
+      case DrawBackend::DrawCommands:
+        return cull ? bourbon::DrawSubmission::Mode::DrawCommandsWithCull
+                    : bourbon::DrawSubmission::Mode::DrawCommands;
+      case DrawBackend::IndirectDraws:
+      default:
+        return cull ? bourbon::DrawSubmission::Mode::IndirectDrawsWithCull
+                    : bourbon::DrawSubmission::Mode::IndirectDraws;
+    }
+  }
 
   // Whether IndirectDraws' persistent device buffer has been produced by at
   // least one shadowless render drain. IndirectDraws produces that buffer only
@@ -1924,18 +1966,48 @@ struct BourbonContext::Impl {
         .clustered = false,
     };
     // "lit" builds the real integration task; any other surface builds a
-    // ForwardVizTask (ForwardIntegrator.cpp:41). "depth" paints window-space z.
-    bourbon::ForwardVizTask::Params forward_viz = {
-        .surface = viz_depth ? bourbon::Token::Get("depth")
-                             : bourbon::Token::Get("lit"),
-        .texture = bourbon::Token::Get("material"),
-    };
+    // viz task (ForwardIntegrator.cpp:41). "depth" paints window-space z. The
+    // forward and deferred viz-param structs are field-identical, so the same
+    // surface/texture tokens serve both.
+    const bourbon::Token surface = viz_depth ? bourbon::Token::Get("depth")
+                                             : bourbon::Token::Get("lit");
+    const bourbon::Token texture = bourbon::Token::Get("material");
 
-    integrator = bourbon::ForwardIntegrator::Create(
-        clear_task->color(), camera.get(), world.get(),
-        draw_submission->draws(), draw_submission->shadowDraws(),
-        bxdf_pipelines.get(), forward_viz, integrator_params, *pass_heap,
-        *render_graph, *queue, *renderer_context);
+    // The concrete integrator captures draws()/shadowDraws()/oit and its
+    // surface at construction, so it is picked here from the render path.
+    switch (desired_render_path) {
+      case RenderPath::Deferred:
+        integrator = bourbon::DeferredIntegrator::Create(
+            clear_task->color(), camera.get(), world.get(),
+            draw_submission->draws(), draw_submission->shadowDraws(),
+            bxdf_pipelines.get(),
+            bourbon::GBufferVizTask::Params{.surface = surface,
+                                            .texture = texture},
+            integrator_params, *pass_heap, *render_graph, *queue,
+            *renderer_context);
+        break;
+      case RenderPath::DeferredMaterial:
+        integrator = bourbon::DeferredMaterialIntegrator::Create(
+            clear_task->color(), camera.get(), world.get(),
+            draw_submission->draws(), draw_submission->shadowDraws(),
+            bxdf_pipelines.get(), material_pipelines.get(),
+            bourbon::GBufferVizTask::Params{.surface = surface,
+                                            .texture = texture},
+            integrator_params, *pass_heap, *render_graph, *queue,
+            *renderer_context);
+        break;
+      case RenderPath::Forward:
+      default:
+        integrator = bourbon::ForwardIntegrator::Create(
+            clear_task->color(), camera.get(), world.get(),
+            draw_submission->draws(), draw_submission->shadowDraws(),
+            bxdf_pipelines.get(),
+            bourbon::ForwardVizTask::Params{.surface = surface,
+                                            .texture = texture},
+            integrator_params, *pass_heap, *render_graph, *queue,
+            *renderer_context);
+        break;
+    }
 
     drawable_source = std::make_unique<DrawableImageSource>(*render_graph);
 
@@ -1946,6 +2018,7 @@ struct BourbonContext::Impl {
     built_mode = mode;
     built_oit = oit;
     built_viz_depth = viz_depth;
+    built_render_path = desired_render_path;
     built_valid = true;
   }
 
@@ -3715,6 +3788,32 @@ void BourbonContext::Init(const mjModel* model) {
   // A reload re-dirties shape morphology, so IndirectDraws stage 1 runs again on
   // the next frame; re-prime (one shadowless drain) before re-enabling shadows.
   impl_->primed = false;
+
+  // Optional MJCF overrides for the initial render options, mirroring how the
+  // Filament backend reads `filament.clearColor` (filament_renderer.cc). Each is
+  // a scalar mjOBJ_NUMERIC; a missing/mismatched entry leaves the default. The
+  // per-frame structural check picks the new values up on the next frame.
+  if (model != nullptr) {
+    auto read_int = [&](const char* name, int lo, int hi,
+                        int fallback) -> int {
+      const int id = mj_name2id(model, mjOBJ_NUMERIC, name);
+      if (id < 0 || model->numeric_size[id] < 1) return fallback;
+      const int v =
+          static_cast<int>(model->numeric_data[model->numeric_adr[id]]);
+      return (v < lo || v > hi) ? fallback : v;
+    };
+    Impl& s = *impl_;
+    s.desired_render_path = static_cast<Impl::RenderPath>(
+        read_int("bourbon.renderPath", 0, 2,
+                 static_cast<int>(s.desired_render_path)));
+    s.desired_draw_backend = static_cast<Impl::DrawBackend>(
+        read_int("bourbon.drawBackend", 0, 1,
+                 static_cast<int>(s.desired_draw_backend)));
+    s.draw_cull = read_int("bourbon.cull", 0, 1, s.draw_cull ? 1 : 0) != 0;
+    s.desired_semi_transparency = static_cast<Impl::SemiTransparency>(
+        read_int("bourbon.oit", 0, 1,
+                 static_cast<int>(s.desired_semi_transparency)));
+  }
 }
 
 void BourbonContext::SetClearColor(float r, float g, float b, float a) {
@@ -3862,20 +3961,35 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     // as soon as the scene has, or could have, a blended geom. Both inputs are
     // stable frame to frame -- `any_transparent` is sticky per model and the
     // flag is user-toggled -- so this cannot thrash the pass graph.
-    s.oit = (s.any_transparent || transparent) ? bourbon::OITKind::MLAB
-                                               : bourbon::OITKind::None;
+    s.oit = (s.any_transparent || transparent)
+                ? (s.desired_semi_transparency == Impl::SemiTransparency::WBOIT
+                       ? bourbon::OITKind::WBOIT
+                       : bourbon::OITKind::MLAB)
+                : bourbon::OITKind::None;
 
-    // --- Sync shadow sources to the shadow enable. The submission mode stays
-    // IndirectDrawsWithCull regardless (see the constructor): only the set of
-    // shadow sources changes, which is what gates the pass-graph rebuild below.
+    // The submission mode and render path this frame come from the user's
+    // selections. A change of either changes which IndirectDraws device buffer
+    // the shadow cull binds, so it must re-prime (one shadowless drain runs
+    // IndirectDraws stage 1) -- and that decision has to be made BEFORE
+    // UpdateShadows below, or this frame would enable shadows against the
+    // not-yet-produced buffer of the mode we are about to rebuild onto. A
+    // shadow-morphology-only or OIT-only rebuild does not touch that buffer and
+    // keeps `primed`.
+    const bourbon::DrawSubmission::Mode desired_mode =
+        Impl::ToMode(s.desired_draw_backend, s.draw_cull);
+    if (s.built_valid && (s.built_mode != desired_mode ||
+                          s.built_render_path != s.desired_render_path)) {
+      s.primed = false;
+    }
+
+    // --- Sync shadow sources to the shadow enable. Only the set of shadow
+    // sources changes here, which is what gates the pass-graph rebuild below.
     // Shadows are held off until the scene has been primed by one shadowless
     // render drain (see `primed`): that drain runs IndirectDraws stage 1, which
     // produces the persistent device buffer the shadow cull binds. Without this,
     // the first frame would collide stage 1 with the shadow cull in one sweep
     // and the cull would read a null buffer.
     s.UpdateShadows(shadow_enabled && s.primed);
-    const bourbon::DrawSubmission::Mode desired_mode =
-        bourbon::DrawSubmission::Mode::IndirectDrawsWithCull;
 
     // --- Evaluate the model (scene state) graph. ---
     s.model_heap->free();
@@ -3883,13 +3997,15 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     s.model_graph_evaluator->evaluate(*s.model_heap, *s.core);
 
     // --- Structural pass-graph sync. The shadow-source morphology is computed
-    // by the model graph just evaluated; rebuild the pass graph if the draw mode
-    // or that morphology changed (an add/remove of a shadow source). setMode is
-    // pushed every frame so the submission back-end matches the built graph.
+    // by the model graph just evaluated; rebuild the pass graph if the draw mode,
+    // render path, OIT kind, depth-viz surface, or that morphology changed.
+    // setMode is pushed every frame so the submission back-end matches the built
+    // graph.
     const uint64_t morphology = s.world->shadow_source_morphology().value();
     if (!s.built_valid || s.built_mode != desired_mode ||
         s.built_shadow_morphology != morphology || s.built_oit != s.oit ||
-        s.built_viz_depth != s.viz_depth) {
+        s.built_viz_depth != s.viz_depth ||
+        s.built_render_path != s.desired_render_path) {
       s.RebuildPassGraph(desired_mode, morphology);
     }
     s.draw_submission->setMode(desired_mode);
@@ -3942,5 +4058,88 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
 }
 
 double BourbonContext::GetFps() const { return impl_->fps; }
+
+void BourbonContext::DrawOptionsGui() {
+  Impl& s = *impl_;
+
+  // Render path.
+  {
+    struct Item {
+      const char* label;
+      Impl::RenderPath value;
+    };
+    static constexpr Item kItems[] = {
+        {"Forward", Impl::RenderPath::Forward},
+        {"Deferred", Impl::RenderPath::Deferred},
+        {"Deferred material", Impl::RenderPath::DeferredMaterial},
+    };
+    const char* current = "Forward";
+    for (const Item& item : kItems) {
+      if (item.value == s.desired_render_path) current = item.label;
+    }
+    if (ImGui::BeginCombo("Render path", current)) {
+      for (const Item& item : kItems) {
+        if (ImGui::Selectable(item.label,
+                              item.value == s.desired_render_path)) {
+          s.desired_render_path = item.value;
+        }
+      }
+      ImGui::EndCombo();
+    }
+  }
+
+  // Draw submission back-end + frustum cull.
+  {
+    struct Item {
+      const char* label;
+      Impl::DrawBackend value;
+    };
+    static constexpr Item kItems[] = {
+        {"Indirect draws", Impl::DrawBackend::IndirectDraws},
+        {"Draw commands", Impl::DrawBackend::DrawCommands},
+    };
+    const char* current = "Indirect draws";
+    for (const Item& item : kItems) {
+      if (item.value == s.desired_draw_backend) current = item.label;
+    }
+    if (ImGui::BeginCombo("Submission", current)) {
+      for (const Item& item : kItems) {
+        if (ImGui::Selectable(item.label,
+                              item.value == s.desired_draw_backend)) {
+          s.desired_draw_backend = item.value;
+        }
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::Checkbox("Frustum cull", &s.draw_cull);
+  }
+
+  // Order-independent transparency technique. Only takes effect when the scene
+  // has (or could have) a translucent geom; an opaque scene runs with OIT off
+  // regardless of this choice.
+  {
+    struct Item {
+      const char* label;
+      Impl::SemiTransparency value;
+    };
+    static constexpr Item kItems[] = {
+        {"MLAB", Impl::SemiTransparency::MLAB},
+        {"WBOIT", Impl::SemiTransparency::WBOIT},
+    };
+    const char* current = "MLAB";
+    for (const Item& item : kItems) {
+      if (item.value == s.desired_semi_transparency) current = item.label;
+    }
+    if (ImGui::BeginCombo("Transparency", current)) {
+      for (const Item& item : kItems) {
+        if (ImGui::Selectable(item.label,
+                              item.value == s.desired_semi_transparency)) {
+          s.desired_semi_transparency = item.value;
+        }
+      }
+      ImGui::EndCombo();
+    }
+  }
+}
 
 }  // namespace mujoco::render_bourbon

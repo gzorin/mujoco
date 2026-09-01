@@ -79,6 +79,8 @@ bool BourbonRenderer::SupportsRenderFlag(int flag) const {
   }
 }
 
+void BourbonRenderer::DrawOptionsGui() { context_->DrawOptionsGui(); }
+
 double BourbonRenderer::GetFps() { return context_->GetFps(); }
 
 }  // namespace mujoco::platform
