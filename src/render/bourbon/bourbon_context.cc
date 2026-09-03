@@ -1883,7 +1883,7 @@ struct BourbonContext::Impl {
   // BuildPassGraph. The GUI combo / bourbon.renderPath still let a user pick
   // Forward (which then runs without SSAO).
   RenderPath desired_render_path = RenderPath::Deferred;
-  DrawBackend desired_draw_backend = DrawBackend::IndirectDraws;
+  DrawBackend desired_draw_backend = DrawBackend::DrawCommands;
   bool draw_cull = true;
   SemiTransparency desired_semi_transparency = SemiTransparency::MLAB;
   RenderPath built_render_path = RenderPath::Forward;
