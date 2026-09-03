@@ -169,6 +169,17 @@ Window::Window(std::string_view title, int width, int height, Config config)
   int drawable_height = height_;
   SDL_GL_GetDrawableSize(sdl_window_, &drawable_width, &drawable_height);
   scale_ = (float)drawable_width / (float)width_;
+
+  // Claim keyboard focus at startup. When the binary is launched from a terminal
+  // (rather than as a bundled .app), macOS does not reliably make our window the
+  // "key window", so it receives mouse events but no keyboard events -- Ctrl+drag
+  // body manipulation and every keyboard shortcut silently break while the camera
+  // still moves. SDL_RaiseWindow() runs [NSApp activateIgnoringOtherApps:YES] +
+  // makeKeyAndOrderFront:, which forces key-window status. See NewFrame() for the
+  // matching runtime reclaim when focus is later lost.
+  if (!IsHeadless(config_.gfx_mode)) {
+    SDL_RaiseWindow(sdl_window_);
+  }
 }
 
 Window::~Window() {
@@ -210,6 +221,17 @@ Window::Status Window::NewFrame() {
   SDL_Event event;
   while (SDL_PollEvent(&event)) {
     ImGui_ImplSDL2_ProcessEvent(&event);
+
+    // Reclaim keyboard focus if the user clicks into the window while it is not
+    // the macOS "key window". In that state mouse events are still delivered
+    // (acceptsFirstMouse) but no key events are, which silently breaks Ctrl+drag
+    // body manipulation and every keyboard shortcut. Only fires when focus is
+    // actually missing, so it is a no-op during normal use. See the constructor
+    // for the matching startup claim.
+    if (event.type == SDL_MOUSEBUTTONDOWN &&
+        !(SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_INPUT_FOCUS)) {
+      SDL_RaiseWindow(sdl_window_);
+    }
 
     if (event.type == SDL_QUIT) {
       should_exit_ = true;
