@@ -72,10 +72,17 @@ cmake -S . -B build-studio \
   -DMUJOCO_USE_BOURBON=ON \
   -DMUJOCO_USE_FILAMENT=OFF \
   -DMUJOCO_STUDIO_MACOS_BUNDLE=OFF \
-  -DCMAKE_PREFIX_PATH=/usr/local/bourbon
+  -DBourbon_ROOT=/usr/local/bourbon
 
 cmake --build build-studio --target mujoco_studio --parallel
 ```
+
+`Bourbon_ROOT` is the Bourbon **install prefix**. It is the package-specific hint
+`find_package(Bourbon CONFIG)` uses to locate `lib/cmake/Bourbon/BourbonConfig.cmake`,
+and the same prefix `render_bourbon` resolves the bundled Eigen and the runtime
+dylib rpath from. Prefer it over the broad `-DCMAKE_PREFIX_PATH`, which pollutes
+the search prefix for every other package. (`-DBourbon_DIR=/usr/local/bourbon/lib/cmake/Bourbon`,
+pointing directly at the config directory, also works.)
 
 This produces a plain executable plus its assets:
 
@@ -130,7 +137,7 @@ cmake -S . -B build-studio \
   -DMUJOCO_BUILD_STUDIO=ON \
   -DMUJOCO_USE_BOURBON=ON \
   -DMUJOCO_USE_FILAMENT=OFF \
-  -DCMAKE_PREFIX_PATH=/usr/local/bourbon
+  -DBourbon_ROOT=/usr/local/bourbon
 
 cmake --build build-studio --target mujoco_studio --parallel
 ```
@@ -211,7 +218,7 @@ xattr -dr com.apple.quarantine "/Applications/MuJoCo Studio.app"
 | `MUJOCO_USE_BOURBON` | `OFF` | Enable this backend. macOS only; fatal error elsewhere. |
 | `MUJOCO_STUDIO_MACOS_BUNDLE` | `ON` when `MUJOCO_BUILD_STUDIO` | Build `mujoco_studio` as `MuJoCo Studio.app`. Orthogonal to `MUJOCO_BUILD_MACOS_FRAMEWORKS`, which governs libmujoco's layout. |
 | `MUJOCO_STUDIO_CODESIGN_IDENTITY` | `-` (ad-hoc) | Identity used to re-sign the bundle. |
-| `MUJOCO_BOURBON_EIGEN_DIR` | `/opt/homebrew/include/eigen3` | The Eigen tree Bourbon's dylibs were compiled against. Must match exactly. |
+| `MUJOCO_BOURBON_EIGEN_DIR` | `<Bourbon prefix>/include/eigen3` | The Eigen tree Bourbon's dylibs were compiled against. Bourbon vendors and installs its own Eigen here; must match exactly. |
 | `MUJOCO_BOURBON_LLAIR_TOOLS_PATH` | from `xcrun -f metal` | Metal toolchain directory baked in as a runtime fast path. |
 
 ---
@@ -260,7 +267,10 @@ fixes look arbitrary otherwise.
 1. **Same Eigen tree.** A different Eigen build silently changes how fixed-size
    Eigen types are passed (e.g. `Array4f` in FP registers vs a GP register or
    memory), shifting the pointer arguments that follow and corrupting the call.
-   `MUJOCO_BOURBON_EIGEN_DIR` is prepended before all other includes.
+   Bourbon vendors its own Eigen and installs it into its prefix at
+   `include/eigen3`; its dylibs are built against that copy, so
+   `MUJOCO_BOURBON_EIGEN_DIR` defaults to it and is prepended before all other
+   includes (ahead of MuJoCo's own fetched Eigen).
 2. **C++20.**
 3. **Default visibility.** Bourbon's DG type system identifies value types by
    the *address* of an `inline constexpr` template variable and compares those
@@ -285,7 +295,7 @@ bug is fixed.
 |---|---|
 | `could not locate the 'metal' tool via 'xcrun -f metal'` at configure time | Install the Metal toolchain (see [Requirements](#requirements)). |
 | Error about the Metal toolchain at first render | Same, or a bad `MUJOCO_BOURBON_LLAIR_TOOLS`. |
-| `find_package(Bourbon)` fails | `CMAKE_PREFIX_PATH` does not point at a prefix containing `lib/cmake/Bourbon/`. |
+| `find_package(Bourbon)` fails | `Bourbon_ROOT` does not point at a prefix containing `lib/cmake/Bourbon/` (or `Bourbon_DIR` not at that config directory). |
 | `connect() type mismatch` at runtime | ABI mismatch — check Eigen tree and that you are testing the build you think you are (see [ABI constraints](#abi-constraints)). |
 | Crash in `Create()` / allocator with garbage pointers | Eigen ABI mismatch (#1 above). |
 | Compile errors in `bourbon_context.cc` after updating Bourbon | API drift; compare against the SHA in `BOURBON_VERSION`. |

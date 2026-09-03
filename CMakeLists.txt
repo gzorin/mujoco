@@ -190,8 +190,15 @@ endif()
 
 # Bourbon Metal renderer (macOS only). Bourbon is not fetched: its two-stage
 # LLVM/LLAIR/MaterialX dependency build is far too heavy to nest inside MuJoCo's
-# configure, so it must be installed separately (see src/render/bourbon) and
-# located via CMAKE_PREFIX_PATH (e.g. -DCMAKE_PREFIX_PATH=/usr/local/bourbon).
+# configure, so it must be installed separately (see src/render/bourbon).
+#
+# Point the build at that install with either package-specific hint honored by
+# find_package(Bourbon CONFIG) below — prefer these over the broad
+# CMAKE_PREFIX_PATH, which pollutes the search prefix for every other package:
+#   -DBourbon_ROOT=/usr/local/bourbon                  (the install PREFIX), or
+#   -DBourbon_DIR=/usr/local/bourbon/lib/cmake/Bourbon (dir with BourbonConfig).
+# Bourbon_ROOT is the friendlier of the two: it is the same prefix from which
+# render_bourbon resolves the bundled Eigen and the runtime dylib rpath.
 if(MUJOCO_USE_BOURBON)
   if(NOT APPLE)
     message(FATAL_ERROR "MUJOCO_USE_BOURBON requires macOS (Bourbon is Metal-only).")

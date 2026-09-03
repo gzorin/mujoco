@@ -49,22 +49,19 @@ get_filename_component(_bourbon_prefix "${_bourbon_libdir}/.." ABSOLUTE)
 # Array4f in FP registers vs a GP register / memory), shifting the pointer
 # arguments that follow and corrupting the call.
 #
-# Bourbon (per its compile_commands.json) builds against Homebrew's Eigen at
-# /opt/homebrew/include/eigen3 — NOT the eigen3 copied into its own install
-# prefix, and NOT MuJoCo's fetched Eigen. Default to that, overridable if
-# bourbon was built elsewhere.
-set(MUJOCO_BOURBON_EIGEN_DIR "/opt/homebrew/include/eigen3" CACHE PATH
+# Bourbon vendors its own Eigen and installs it into its prefix at
+# include/eigen3; its dylibs are built against that copy (NOT a system/Homebrew
+# Eigen, and NOT MuJoCo's fetched Eigen). Default to the copy in bourbon's
+# install prefix, overridable if bourbon was built against an Eigen elsewhere.
+set(MUJOCO_BOURBON_EIGEN_DIR "${_bourbon_prefix}/include/eigen3" CACHE PATH
     "Eigen include dir that bourbon's dylibs were compiled against. Must match \
 exactly to avoid an Eigen ABI mismatch across the bourbon boundary.")
 if(NOT EXISTS "${MUJOCO_BOURBON_EIGEN_DIR}/Eigen/Core")
-  # Fall back to the eigen shipped in bourbon's install prefix.
-  if(EXISTS "${_bourbon_prefix}/include/eigen3/Eigen/Core")
-    set(MUJOCO_BOURBON_EIGEN_DIR "${_bourbon_prefix}/include/eigen3")
-  else()
-    message(FATAL_ERROR "render_bourbon: could not find the Eigen tree bourbon "
-      "was built against. Set MUJOCO_BOURBON_EIGEN_DIR to it (check bourbon's "
-      "build compile_commands.json for the -isystem .../eigen3 path).")
-  endif()
+  message(FATAL_ERROR "render_bourbon: could not find the Eigen tree bourbon "
+    "was built against. Expected it in bourbon's install prefix at "
+    "${_bourbon_prefix}/include/eigen3. Set MUJOCO_BOURBON_EIGEN_DIR to the "
+    "correct location (check bourbon's build compile_commands.json for the "
+    "-isystem .../eigen3 path).")
 endif()
 message(STATUS "render_bourbon: using bourbon-matched Eigen at ${MUJOCO_BOURBON_EIGEN_DIR}")
 target_include_directories(render_bourbon BEFORE PRIVATE
