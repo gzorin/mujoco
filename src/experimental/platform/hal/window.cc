@@ -217,6 +217,16 @@ std::string Window::GetDropFile() {
   return tmp;
 }
 
+bool Window::IsCtrlPressed() const {
+  return (SDL_GetModState() & KMOD_CTRL) != 0;
+}
+bool Window::IsShiftPressed() const {
+  return (SDL_GetModState() & KMOD_SHIFT) != 0;
+}
+bool Window::IsAltPressed() const {
+  return (SDL_GetModState() & KMOD_ALT) != 0;
+}
+
 Window::Status Window::NewFrame() {
   SDL_Event event;
   while (SDL_PollEvent(&event)) {

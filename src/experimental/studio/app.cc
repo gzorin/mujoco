@@ -592,23 +592,31 @@ void App::HandleMouseEvents() {
                                  ImGui::IsMouseDown(ImGuiMouseButton_Middle);
   const bool is_mouse_dragging = is_mouse_moving && is_any_mouse_down;
 
+  // Poll live modifier-key state instead of ImGui's io.KeyCtrl/Shift/Alt, which
+  // are reconstructed from the trickled event queue and can lag the real key
+  // state by a frame at drag-start -- intermittently dropping the Ctrl gate on
+  // body manipulation. Matches how `simulate` reads modifiers with glfwGetKey().
+  const bool key_ctrl = window_->IsCtrlPressed();
+  const bool key_shift = window_->IsShiftPressed();
+  const bool key_alt = window_->IsAltPressed();
+
   // If no mouse buttons are down, end any active perturbations.
   if (!is_any_mouse_down) {
     perturb_.active = 0;
   }
 
   // Handle perturbation mouse actions.
-  if (is_mouse_dragging && io.KeyCtrl) {
+  if (is_mouse_dragging && key_ctrl) {
     if (perturb_.select > 0) {
       mjtMouse action = mjMOUSE_NONE;
       if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        if (io.KeyAlt) {
-          action = io.KeyShift ? mjMOUSE_MOVE_H : mjMOUSE_MOVE_V;
+        if (key_alt) {
+          action = key_shift ? mjMOUSE_MOVE_H : mjMOUSE_MOVE_V;
         } else {
-          action = io.KeyShift ? mjMOUSE_ROTATE_H : mjMOUSE_ROTATE_V;
+          action = key_shift ? mjMOUSE_ROTATE_H : mjMOUSE_ROTATE_V;
         }
       } else if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
-        action = io.KeyShift ? mjMOUSE_MOVE_H : mjMOUSE_MOVE_V;
+        action = key_shift ? mjMOUSE_MOVE_H : mjMOUSE_MOVE_V;
       } else if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
         action = mjMOUSE_ZOOM;
       }
@@ -640,7 +648,7 @@ void App::HandleMouseEvents() {
     }
 
     // Right mouse movement is relative to the horizontal and vertical planes.
-    if (ImGui::IsMouseDown(ImGuiMouseButton_Right) && io.KeyShift) {
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Right) && key_shift) {
       mjv_moveCamera(model(), mjMOUSE_MOVE_H, mouse_dx, mouse_dy, &camera_);
     } else if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
       mjv_moveCamera(model(), mjMOUSE_MOVE_V, mouse_dx, mouse_dy, &camera_);
@@ -692,7 +700,7 @@ void App::HandleMouseEvents() {
         platform::Pick(model(), data(), &camera_, mouse_x, mouse_y,
                        window_->GetAspectRatio(), &vis_options_);
     mju_copy3(camera_.lookat, picked.point);
-    if (picked.body > 0 && io.KeyCtrl) {
+    if (picked.body > 0 && key_ctrl) {
       // Switch camera to tracking mode and track the selected body.
       camera_.type = mjCAMERA_TRACKING;
       camera_.trackbodyid = picked.body;

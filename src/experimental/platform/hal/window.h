@@ -72,6 +72,16 @@ class Window {
                : 1.0f;
   }
 
+  // Live physical modifier-key state, polled from SDL rather than reconstructed
+  // from ImGui's trickled event queue. ImGui's io.KeyCtrl/Shift/Alt can lag the
+  // real key state by a frame at drag-start (a mouse-button change defers the
+  // key event to the next frame), which intermittently drops the modifier gate
+  // on Ctrl+drag body manipulation. Mirrors what `simulate` does with
+  // glfwGetKey(). Prefer these for real-time input gating.
+  bool IsCtrlPressed() const;
+  bool IsShiftPressed() const;
+  bool IsAltPressed() const;
+
   // Returns the path to a file that was dropped on the window. Once called,
   // the value will be cleared until the next time a file is dropped.
   std::string GetDropFile();
