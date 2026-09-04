@@ -2793,13 +2793,17 @@ struct BourbonContext::Impl {
   }
 
   // Builds the single image-based (environment) light: the indirect/ambient
-  // term of the scene. Its source is a lat-long radiance image in nits, built
-  // on the host from, in order of preference, the first mjLIGHT_IMAGE light's
-  // texture, the model's skybox, or -- failing both -- a two-colour gradient
-  // synthesized from MuJoCo's own ambient terms. Everything about it (the
-  // radiance, and the frame that puts MuJoCo's +z at the environment's zenith)
-  // is baked here: the light has no live intensity knob, and its node never
-  // moves, so UpdateLights skips it.
+  // term of the scene. Its source is a lat-long RELATIVE-radiance image in
+  // [0,1], built on the host from, in order of preference, the first
+  // mjLIGHT_IMAGE light's texture, the model's skybox, or -- failing both -- a
+  // two-colour gradient synthesized from MuJoCo's own ambient terms. The
+  // photometric scale (nits) that places that relative radiance in physical
+  // units is carried by the light's own intensity() plug, NOT baked into the
+  // pixels: bourbon multiplies both the sampled radiance and irradiance by that
+  // intensity at shade time (default 8000 nt), so baking a scale into the map
+  // too would double it and blow the scene out white. The frame (which puts
+  // MuJoCo's +z at the environment's zenith) and the intensity are both fixed
+  // here, and its node never moves, so UpdateLights skips it.
   void BuildEnvironment(const mjModel* m, int image_light) {
     // Pick the source texture, if any.
     int texid = -1;
@@ -2832,11 +2836,13 @@ struct BourbonContext::Impl {
       }
     }
 
-    // Radiance calibration. A textured environment's [0,1] pixels are scaled
-    // to nits; an untextured one is a gradient whose upper hemisphere carries
-    // MuJoCo's ambient (see kSkyboxIrradianceFraction for the derivation of
-    // both). A uniform environment of radiance L delivers pi*L lux, hence the
-    // division.
+    // Radiance calibration. `nits` is the scalar luminance carried by the
+    // light's intensity() plug; the map pixels stay RELATIVE ([0,1] for a
+    // texture, [0,1]-ish tint for the gradient) so the scale is applied exactly
+    // once, at shade time (see the note on the intensity plug above). An
+    // untextured environment is a gradient whose upper hemisphere carries
+    // MuJoCo's ambient (see kSkyboxIrradianceFraction for the derivation). A
+    // uniform environment of radiance L delivers pi*L lux, hence the division.
     const float reference = ReferenceIlluminance(m);
     float nits = 0.0f;
     Eigen::Array3f sky = Eigen::Array3f::Zero();
@@ -2868,7 +2874,10 @@ struct BourbonContext::Impl {
       // colour the air; it defaults to white, so this is a no-op by default.
       const Eigen::Array3f haze(m->vis.rgba.haze[0], m->vis.rgba.haze[1],
                                 m->vis.rgba.haze[2]);
-      sky = ambient * haze * reference / kPi;
+      // Relative gradient tint; the reference/pi photometric scale rides the
+      // intensity plug (as it does for a texture), not the pixels.
+      nits = reference / kPi;
+      sky = ambient * haze;
       ground = sky * kEnvGroundFraction;
     }
 
@@ -2888,9 +2897,10 @@ struct BourbonContext::Impl {
         if (texid >= 0) {
           // Cube textures are sampled in object space (MuJoCo's skybox cubes
           // are y-up, which is this light's own frame); an equirectangular 2D
-          // texture in world space, where up is MuJoCo's +z.
-          c = nits * (cube ? SampleCubeTexture(m, texid, obj)
-                           : SampleLatLongTexture(m, texid, dir));
+          // texture in world space, where up is MuJoCo's +z. Kept relative
+          // ([0,1]); the nits scale is applied by the intensity plug below.
+          c = cube ? SampleCubeTexture(m, texid, obj)
+                   : SampleLatLongTexture(m, texid, dir);
         } else {
           // Smoothstep in the world z cosine: a soft horizon, so the gradient
           // reads as a sky dome over a ground plane rather than a hard seam.
@@ -2919,6 +2929,7 @@ struct BourbonContext::Impl {
     L.kind = bourbon::SGObjectKind::LatLongEnvironmentLight;
     L.source = bourbon::LatLongEnvironmentLight::Create(
         {.image = env_source_image,
+         .intensity = nits,
          .irradiance_map_height = kEnvIrradianceHeight,
          .irradiance_map_sample_count = kEnvIrradianceSampleCount,
          .radiance_map_height = kEnvRadianceHeight},
