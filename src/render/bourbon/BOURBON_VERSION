@@ -2,8 +2,10 @@ The MuJoCo Bourbon renderer backend was developed against the following bourbon
 commit. Bourbon's API is under active development; if you hit build failures in
 src/render/bourbon after updating bourbon, this is the reference revision.
 
-bourbon git SHA: b842705148c67d46c4843f1d6b9be0a40cd23ad6
-(branch merge: "tessellation-shape-improvements" / "sdf-revisions")
+bourbon git SHA: 516973af4ed57831a793a7f5a5bd810cc7bf274b
+("Make every render pass resize with the framebuffer via extent_in()" --
+required for live window resize; the backend pushes ResolveTask::extent_in()
+per frame and an older bourbon lacks that plug.)
 
 Bourbon must be built and installed separately (it is not fetched by MuJoCo's
 configure). Point MuJoCo at it with -DCMAKE_PREFIX_PATH=/usr/local/bourbon and
