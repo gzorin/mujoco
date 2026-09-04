@@ -1841,6 +1841,20 @@ struct BourbonContext::Impl {
   // from anything that moves per frame (see the plan's R7).
   bool built_valid = false;
   bourbon::DrawSubmission::Mode built_mode = bourbon::DrawSubmission::Mode::Direct;
+  // The drawable extent the pass graph was built at. The swapchain extent is a
+  // live query of the CAMetalLayer's drawableSize (which SDL keeps in sync with
+  // the window on resize), but bourbon's incremental resize path is incomplete:
+  // every rasterizing/compute pass sets its viewport from a `d_extent` member
+  // baked at construction, and Integrator::setExtent() only pushes the new
+  // extent into the render-target *rings* (the DepthAndBXDF/WBOIT extent_in
+  // plugs), never into those viewport members. So a live resize would grow the
+  // textures but keep drawing into the old-size sub-rect of each -- the reported
+  // "framebuffer keeps its prior size" flicker in the exposed margin. Until
+  // bourbon grows a real per-frame extent path (see the plan's bourbon-side
+  // note), the extent is part of the structural key: a change forces a full
+  // RebuildPassGraph, which reconstructs every task at the new size (the same
+  // code path as the initial build, hence always correct across all passes).
+  bourbon::DeviceImage<2>::Extent built_extent = {0, 0};
   uint64_t built_shadow_morphology = 0;
   bourbon::OITKind built_oit = bourbon::OITKind::None;
   bourbon::OITKind oit = bourbon::OITKind::None;
@@ -2094,6 +2108,7 @@ struct BourbonContext::Impl {
     built_oit = oit;
     built_viz_depth = viz_depth;
     built_render_path = desired_render_path;
+    built_extent = extent;
     built_valid = true;
   }
 
@@ -4091,14 +4106,16 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
 
     // --- Structural pass-graph sync. The shadow-source morphology is computed
     // by the model graph just evaluated; rebuild the pass graph if the draw mode,
-    // render path, OIT kind, depth-viz surface, or that morphology changed.
-    // setMode is pushed every frame so the submission back-end matches the built
-    // graph.
+    // render path, OIT kind, depth-viz surface, the drawable extent (window
+    // resize; see built_extent), or that morphology changed. setMode is pushed
+    // every frame so the submission back-end matches the built graph.
     const uint64_t morphology = s.world->shadow_source_morphology().value();
+    const bool extent_changed = s.built_extent[0] != extent[0] ||
+                                s.built_extent[1] != extent[1];
     if (!s.built_valid || s.built_mode != desired_mode ||
         s.built_shadow_morphology != morphology || s.built_oit != s.oit ||
         s.built_viz_depth != s.viz_depth ||
-        s.built_render_path != s.desired_render_path) {
+        s.built_render_path != s.desired_render_path || extent_changed) {
       s.RebuildPassGraph(desired_mode, morphology);
     }
     s.draw_submission->setMode(desired_mode);
