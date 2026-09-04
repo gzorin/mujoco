@@ -2572,9 +2572,9 @@ struct BourbonContext::Impl {
                               float value,
                               bourbon::LightSource::Intensity::Unit unit) const {
     if (!L.source) return;
-    bourbon::LightSource::Colour color;
-    color.kind = bourbon::LightSource::Colour::Kind::RGB;
-    color.rgb = rgb;
+    bourbon::LightSource::EmissionColor color;
+    color.kind = bourbon::LightSource::EmissionColor::Kind::RGB;
+    color.color.rgb = rgb;
     color.normalise = false;
     const bourbon::LightSource::Intensity intensity{value, unit};
     switch (L.kind) {
@@ -2660,10 +2660,10 @@ struct BourbonContext::Impl {
     int image_light = -1;  // first mjLIGHT_IMAGE, drives the environment light
     for (int i = 0; i < m->nlight; ++i) {
       Light L;
-      bourbon::LightSource::Colour color;
-      color.rgb = Eigen::Array3f(m->light_diffuse[3 * i + 0],
-                                 m->light_diffuse[3 * i + 1],
-                                 m->light_diffuse[3 * i + 2]);
+      bourbon::LightSource::EmissionColor color;
+      color.color.rgb = Eigen::Array3f(m->light_diffuse[3 * i + 0],
+                                       m->light_diffuse[3 * i + 1],
+                                       m->light_diffuse[3 * i + 2]);
 
       // MuJoCo's OpenGL quadratic attenuation model (constant, linear,
       // quadratic), forwarded verbatim; bourbon's shader uses the same
