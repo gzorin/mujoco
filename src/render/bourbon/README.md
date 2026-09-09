@@ -54,10 +54,7 @@ directories. The rest of the integration lives outside:
 ## Requirements
 
 - **macOS** with a Metal-capable GPU.
-- **Xcode**, plus the **Metal toolchain**.
-  ```sh
-  xcodebuild -downloadComponent MetalToolchain
-  ```
+- **Xcode**.
 - **Bourbon**, built and installed separately. MuJoCo does not fetch it.
 
 ---
@@ -157,9 +154,9 @@ Assembly happens **POST_BUILD, not at install time**, deliberately: the bundle
 you launch out of the build tree during development is byte-for-byte the one
 that ships, so a missing dylib cannot hide until packaging.
 
-The bundle is self-contained apart from the Metal toolchain. Every dylib is
-embedded and every load command is bundle-relative — the executable's only rpath
-is `@executable_path/../Frameworks`. You can verify that:
+The bundle is self-contained. Every dylib is embedded and every load command is
+bundle-relative — the executable's only rpath is
+`@executable_path/../Frameworks`. You can verify that:
 
 ```sh
 B="build-studio/bin/MuJoCo Studio.app"
@@ -198,8 +195,8 @@ cmake --build build-studio --target mujoco_studio_dmg
 ```
 
 Produces `build-studio/MuJoCo-Studio-<version>.dmg`, containing the `.app`, an
-`/Applications` symlink for drag-install, and a `README.txt` covering the Metal
-toolchain requirement. The target is excluded from `all`.
+`/Applications` symlink for drag-install, and a `README.txt`. The target is
+excluded from `all`.
 
 Ad-hoc-signed builds are fine for hand-distribution but are **not notarized**,
 so Gatekeeper will block them on another machine until the recipient clears
@@ -219,40 +216,6 @@ xattr -dr com.apple.quarantine "/Applications/MuJoCo Studio.app"
 | `MUJOCO_STUDIO_MACOS_BUNDLE` | `ON` when `MUJOCO_BUILD_STUDIO` | Build `mujoco_studio` as `MuJoCo Studio.app`. Orthogonal to `MUJOCO_BUILD_MACOS_FRAMEWORKS`, which governs libmujoco's layout. |
 | `MUJOCO_STUDIO_CODESIGN_IDENTITY` | `-` (ad-hoc) | Identity used to re-sign the bundle. |
 | `MUJOCO_BOURBON_EIGEN_DIR` | `<Bourbon prefix>/include/eigen3` | The Eigen tree Bourbon's dylibs were compiled against. Bourbon vendors and installs its own Eigen here; must match exactly. |
-| `MUJOCO_BOURBON_LLAIR_TOOLS_PATH` | from `xcrun -f metal` | Metal toolchain directory baked in as a runtime fast path. |
-
----
-
-## Metal toolchain: a runtime dependency
-
-Bourbon compiles its Metal pipelines **at runtime** through `llair`, which needs
-the `metal` compiler on disk. The `.app` therefore cannot be made fully
-self-contained in this one respect: a machine with only the Command Line Tools
-will install it fine and then fail on first render.
-
-`bourbon_context.cc` resolves the toolchain directory once, on first use:
-
-1. The `MUJOCO_BOURBON_LLAIR_TOOLS` environment variable, if set. It must name a
-   directory containing `metal`; if it does not, that is a hard error rather
-   than a silent fallback — an explicit override that is wrong should be
-   reported, not worked around.
-2. The CMake-baked `MUJOCO_BOURBON_LLAIR_TOOLS_PATH`, **only if that directory
-   still contains `metal`**.
-3. `xcrun -f metal`.
-4. Otherwise, an error naming `xcodebuild -downloadComponent MetalToolchain`.
-
-Step 2's existence check is the load-bearing one. On recent macOS the toolchain
-lives on a cryptex mount whose path carries a per-mount suffix, e.g.
-
-```
-/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.y3Nbj3/Metal.xctoolchain/usr/bin
-```
-
-That suffix is regenerated on every mount, so a path captured at configure time
-goes stale across a reboot or a toolchain update — and is meaningless inside a
-relocated `.app`. Checking it before use lets that case self-heal via `xcrun`
-instead of hard-failing. The baked path is tried before `xcrun` only to keep a
-subprocess off the common path.
 
 ---
 
@@ -293,8 +256,6 @@ bug is fixed.
 
 | Symptom | |
 |---|---|
-| `could not locate the 'metal' tool via 'xcrun -f metal'` at configure time | Install the Metal toolchain (see [Requirements](#requirements)). |
-| Error about the Metal toolchain at first render | Same, or a bad `MUJOCO_BOURBON_LLAIR_TOOLS`. |
 | `find_package(Bourbon)` fails | `Bourbon_ROOT` does not point at a prefix containing `lib/cmake/Bourbon/` (or `Bourbon_DIR` not at that config directory). |
 | `connect() type mismatch` at runtime | ABI mismatch — check Eigen tree and that you are testing the build you think you are (see [ABI constraints](#abi-constraints)). |
 | Crash in `Create()` / allocator with garbage pointers | Eigen ABI mismatch (#1 above). |

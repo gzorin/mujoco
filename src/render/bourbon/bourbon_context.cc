@@ -20,14 +20,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>  // NOLINT(build/c++17)
 #include <map>
 #include <memory>
 #include <memory_resource>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -108,27 +104,6 @@
 
 #include "render/bourbon/support/imgui_metalcpp.h"
 
-// WORKAROUND: llair::setPathToTools(llvm::StringRef) must run before bourbon
-// compiles any Metal pipeline, but the installed bourbon package ships neither
-// the llair header nor LLVM's headers. We declare an ABI-compatible minimal
-// llvm::StringRef (a {const char*, size_t} standard-layout, trivially-copyable
-// pair, matching LLVM's layout and calling convention) so the symbol resolves
-// from BourbonCore at link time. Bourbon-side fix: install llair/Tools/Tools.h
-// (or expose a const char* overload of setPathToTools).
-namespace llvm {
-class StringRef {
- public:
-  StringRef(const char* s) : Data(s), Length(s ? __builtin_strlen(s) : 0) {}
-
- private:
-  const char* Data;
-  __SIZE_TYPE__ Length;
-};
-}  // namespace llvm
-namespace llair {
-void setPathToTools(llvm::StringRef path);
-}  // namespace llair
-
 namespace mujoco::render_bourbon {
 
 namespace {
@@ -138,81 +113,6 @@ using DrawableImageSource =
 
 constexpr MTL::PixelFormat kColorFormat = MTL::PixelFormatRGBA16Float;
 constexpr MTL::PixelFormat kDepthFormat = MTL::PixelFormatDepth32Float_Stencil8;
-
-// Returns the directory holding the Metal toolchain, or an empty string.
-// Asks xcrun rather than searching PATH: the toolchain is not on the default
-// PATH. A Finder-launched .app inherits /usr/bin so xcrun itself resolves, and
-// DEVELOPER_DIR is unset there, so xcrun falls back to the xcode-select
-// default -- which is the right answer.
-std::string MetalToolsPathFromXcrun() {
-  FILE* pipe = popen("xcrun -f metal 2>/dev/null", "r");
-  if (!pipe) {
-    return "";
-  }
-  std::string out;
-  char buf[1024];
-  while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
-    out += buf;
-  }
-  if (pclose(pipe) != 0 || out.empty()) {
-    return "";
-  }
-  while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
-    out.pop_back();
-  }
-  if (out.empty()) {
-    return "";
-  }
-  return std::filesystem::path(out).parent_path().string();
-}
-
-// Directory containing the Metal toolchain, resolved once on first use.
-//
-// The CMake-baked path is tried before xcrun to keep a subprocess off the
-// common path, but only if it still points at a real toolchain: on recent
-// macOS the toolchain lives on a cryptex mount whose path carries a
-// per-mount suffix, so the configure-time value goes stale across a reboot or
-// a Metal toolchain update -- and is meaningless inside a relocated .app.
-// The existence check is what makes that case self-heal via xcrun instead of
-// hard-failing.
-const char* MetalToolsPath() {
-  static const std::string* const resolved = [] {
-    std::error_code ec;
-    // An explicit override that is wrong is reported rather than silently
-    // ignored: falling through to xcrun would hide the user's mistake behind a
-    // toolchain that happens to work.
-    if (const char* env = std::getenv("MUJOCO_BOURBON_LLAIR_TOOLS")) {
-      if (!std::filesystem::exists(std::filesystem::path(env) / "metal", ec)) {
-        mju_error(
-            "Bourbon renderer: MUJOCO_BOURBON_LLAIR_TOOLS is set to '%s', but "
-            "there is no 'metal' compiler in that directory. Point it at the "
-            "directory containing 'metal' (see 'xcrun -f metal'), or unset it "
-            "to auto-detect.",
-            env);
-      }
-      return new std::string(env);
-    }
-    if (std::filesystem::exists(
-            std::filesystem::path(MUJOCO_BOURBON_LLAIR_TOOLS_PATH) / "metal",
-            ec)) {
-      return new std::string(MUJOCO_BOURBON_LLAIR_TOOLS_PATH);
-    }
-    std::string from_xcrun = MetalToolsPathFromXcrun();
-    if (!from_xcrun.empty()) {
-      return new std::string(std::move(from_xcrun));
-    }
-    mju_error(
-        "Bourbon renderer: cannot find the Metal toolchain (the 'metal' "
-        "compiler), which it needs to build shader pipelines at runtime. "
-        "Neither the build-time path '%s' nor 'xcrun -f metal' resolved. "
-        "Install it with 'xcodebuild -downloadComponent MetalToolchain' (the "
-        "Command Line Tools alone are not sufficient), or point "
-        "MUJOCO_BOURBON_LLAIR_TOOLS at the directory containing 'metal'.",
-        MUJOCO_BOURBON_LLAIR_TOOLS_PATH);
-    return new std::string();  // Unreachable: mju_error does not return.
-  }();
-  return resolved->c_str();
-}
 
 bourbon::DeviceImage<2>::Extent ToExtent(CGSize size) {
   return bourbon::DeviceImage<2>::Extent{static_cast<unsigned>(size.width),
@@ -3776,9 +3676,6 @@ BourbonContext::BourbonContext(void* metal_layer)
   if (!s.device) {
     mju_error("BourbonContext: CAMetalLayer has no MTLDevice");
   }
-
-  // The Metal toolchain must be reachable before any pipeline is built.
-  llair::setPathToTools(MetalToolsPath());
 
   s.mtl_queue = NS::TransferPtr(s.device->newCommandQueue());
   s.core = std::make_unique<bourbon::CoreContext>(s.device, s.mtl_queue.get());

@@ -116,18 +116,6 @@ target_link_libraries(render_bourbon
     dear_imgui_Metal
 )
 
-# Runtime path to the Metal toolchain for llair::setPathToTools, discovered by
-# the root CMakeLists.txt. This is only a fast path: bourbon_context.cc checks
-# that it still contains 'metal' and falls back to xcrun otherwise, because on
-# recent macOS the toolchain lives on a cryptex mount whose path changes per
-# mount. Overridable at configure time here, and at runtime via the
-# MUJOCO_BOURBON_LLAIR_TOOLS environment variable.
-set(MUJOCO_BOURBON_LLAIR_TOOLS_PATH "${MUJOCO_METAL_TOOLS_PATH}" CACHE PATH
-    "Directory containing the Metal toolchain ('metal', 'metallib', ...) baked \
-into render_bourbon as a fast path for llair::setPathToTools.")
-target_compile_definitions(render_bourbon PRIVATE
-  MUJOCO_BOURBON_LLAIR_TOOLS_PATH="${MUJOCO_BOURBON_LLAIR_TOOLS_PATH}")
-
 # The bourbon libraries are imported SHARED targets linked as @rpath/... . Add
 # their install directory (resolved above) to the runtime search path of any
 # executable that links this library (propagated as an INTERFACE link option
