@@ -38,6 +38,9 @@
 #include <BourbonCore/CommandQueue.h>
 #include <BourbonCore/CoreContext.h>
 #include <BourbonCore/DeviceImage.h>
+#include <BourbonCore/DevicePtr.h>
+#include <BourbonCore/DeviceSizeOf.h>
+#include <BourbonCore/DeviceStorage.h>
 #include <BourbonCore/Drawable.h>
 #include <BourbonCore/Framebuffer.h>
 #include <BourbonCore/Future.h>
@@ -45,6 +48,7 @@
 #include <BourbonCore/RenderCommandEncoder.h>
 #include <BourbonCore/RenderPass.h>
 #include <BourbonCore/Swapchain.h>
+#include <BourbonCore/TaskHeap.h>
 
 #include <BourbonMath/Matrices.h>
 #include <BourbonMath/Matrices.cpp>
@@ -1149,18 +1153,59 @@ struct Renderable {
   bool visible = true;
 };
 
+// One deforming per-vertex attribute: a ring of persistent device buffers, one
+// slot per frame, pushed into a TriangleMesh's matching DGDevicePtrInput.
+//
+// Allocated once through the TaskHeap's *synchronous* protocol (allocateBuffer),
+// which places the block immediately and enrols it in the heap's residency set,
+// so it survives the per-frame model_heap->free()/allocate() cycle. The batch
+// protocol (reserveBuffer/New<T,M>) is per-frame scratch and must not be used
+// here. Bourbon's contract, from TriangleMesh.h: allocate once and re-push the
+// same pointer -- a fresh allocation each frame frees a buffer the GPU may still
+// be reading.
+//
+// The ring exists because the dataflow graph orders GPU-vs-GPU but not
+// CPU-vs-GPU, and this context has no CPU-side frame throttle: a single buffer
+// would let this frame's CPU write race the previous frame's GPU read. Bourbon's
+// own deformation example uses the same 3-deep ring.
+template <typename T>
+struct DeformRing {
+  static constexpr unsigned kSlots = 3;
+
+  std::array<bourbon::RefPtr<bourbon::BufferAllocation>, kSlots> allocs;
+  std::array<bourbon::DevicePtr<T, bourbon::DeviceStorage::Managed>, kSlots> ptrs;
+
+  bool allocated() const { return allocs[0] != nullptr; }
+
+  void Allocate(bourbon::TaskHeap& heap, unsigned count) {
+    for (unsigned i = 0; i < kSlots; ++i) {
+      allocs[i] = heap.allocateBuffer(
+          count * bourbon::DeviceSizeOf<T>::value,
+          bourbon::MetalResourceOptions<bourbon::DeviceStorage::Managed>::value);
+      ptrs[i] = bourbon::DevicePtr<T, bourbon::DeviceStorage::Managed>(
+          allocs[i].get(), 0);
+    }
+  }
+
+  // Releasing a BufferAllocation returns its block to the owning heap, which
+  // stamps it against the completion timestamp advanced at the top of the frame
+  // and so will not hand it out again until the GPU has passed that point.
+  void Release() { *this = DeformRing<T>(); }
+};
+
 // A retained flex or skin surface. Unlike a geom, its vertices are world-space
-// and deform every frame, so the node and its identity MatrixTransformer are
-// permanent while the Shape is swapped out whenever the geometry changes: the
-// swap is gated on a checksum of the source vertices, so a static flex/skin
-// costs only the checksum after the first build. All the swap goes through one
-// function (SetFlexSkinShape) so a future in-place TriangleMesh position update
-// (a planned bourbon-side change) is a localized edit. Flexes and skins share
-// this type; they live in parallel lists indexed by flex/skin id.
+// and deform every frame, so the node, its identity MatrixTransformer and its
+// TriangleMesh are all permanent: a deformation is pushed into the mesh's
+// per-vertex attribute inputs in place (see UpdateOneFlexSkin), gated on a
+// checksum of the source vertices so a static flex/skin costs only the checksum.
+// The mesh is rebuilt only when the vertex count or texcoord presence changes,
+// which topology-immutable attribute pushes cannot express. Every Shape and
+// material rebind still goes through one function, SetFlexSkinShape. Flexes and
+// skins share this type; they live in parallel lists indexed by flex/skin id.
 struct FlexSkin {
   bourbon::SGNode* node = nullptr;  // owned by world->model(), identity xform
   bourbon::RefPtr<bourbon::MatrixTransformer> xform;  // identity (world-space verts)
-  bourbon::RefPtr<bourbon::Shape> shape;              // swapped on deformation
+  bourbon::RefPtr<bourbon::TriangleMesh> shape;       // rebuilt only on topology change
   bourbon::ShapeInstance* shape_instance = nullptr;   // owned by node
   bourbon::RefPtr<bourbon::Material> material;         // currently-bound material
   MaterialSpec spec;         // base parameter set (before alpha fade / glow)
@@ -1169,6 +1214,28 @@ struct FlexSkin {
   bool highlighted = false;  // current material carries the selection glow
   bool visible = true;       // node visibility (flags/group)
   uint64_t checksum = 0;     // change-detection over the source vertices
+
+  // The built shape's fixed topology: a push must match both (0 = no shape).
+  unsigned vertex_count = 0;
+  bool has_st = false;
+
+  // Deformation ring buffers, allocated lazily on the first deformation so a
+  // never-moving flex/skin never pays for them. st is deliberately absent: flex
+  // and skin texcoords are static for a fixed topology, so the copy staged at
+  // construction stays correct.
+  DeformRing<Eigen::Vector3f> ring_positions;
+  DeformRing<Eigen::Vector3f> ring_normals;
+  DeformRing<Eigen::Vector3f> ring_dPdU;
+  DeformRing<Eigen::Vector3f> ring_dPdV;
+  unsigned write_slot = 0;
+
+  void ReleaseRings() {
+    ring_positions.Release();
+    ring_normals.Release();
+    ring_dPdU.Release();
+    ring_dPdV.Release();
+    write_slot = 0;
+  }
 };
 
 // FNV-1a over `n` 32-bit words (floats reinterpreted), mixed with `seed`. Used
@@ -1192,6 +1259,19 @@ struct MeshBuild {
   std::vector<Eigen::Vector3f> normals;
   std::vector<Eigen::Vector2f> sts;
   bool has_st = false;
+};
+
+// Destination for one frame of staged flex/skin vertices: either a host
+// MeshBuild (the initial build / a topology-change rebuild) or one slot of a
+// surface's device deformation rings (the steady-state in-place push). Null
+// members are skipped, so the host path leaves dPdU/dPdV to
+// CreateTriangleMeshShape and the device path leaves the static st alone.
+struct VertexSink {
+  Eigen::Vector3f* positions = nullptr;
+  Eigen::Vector3f* normals = nullptr;
+  Eigen::Vector3f* dPdU = nullptr;  // derived from the normal, when non-null
+  Eigen::Vector3f* dPdV = nullptr;
+  Eigen::Vector2f* st = nullptr;
 };
 
 // Frisvad's branchless orthonormal basis: given a unit normal `n`, produces a
@@ -2041,7 +2121,8 @@ struct BourbonContext::Impl {
 
   // Uploads a host triangle soup as a bourbon TriangleMesh Shape, deriving
   // tangents/bitangents per vertex. Returns null for an empty build.
-  bourbon::RefPtr<bourbon::Shape> CreateTriangleMeshShape(const MeshBuild& mb) {
+  bourbon::RefPtr<bourbon::TriangleMesh> CreateTriangleMeshShape(
+      const MeshBuild& mb) {
     const size_t vcount = mb.positions.size();
     if (vcount < 3) return {};
     std::vector<Eigen::Vector3f> tangents(vcount), bitangents(vcount);
@@ -2144,6 +2225,10 @@ struct BourbonContext::Impl {
     highlighted_body = -1;
     // Flex/skin nodes were just destroyed by destroyAllRootNodes; drop the
     // (now dangling) bookkeeping so BuildScene rebuilds them for the new model.
+    // This also releases their deformation ring buffers, whose BufferAllocations
+    // call back into model_heap -- safe here (Init drains the GPU first and the
+    // heap is alive), and safe at teardown because flexes/skins are declared
+    // after model_heap in Impl and so are destroyed before it.
     flexes.clear();
     skins.clear();
     highlighted_flex = -1;
@@ -3085,10 +3170,12 @@ struct BourbonContext::Impl {
   // So no bone-blend / element-vs-smooth port is needed; the arrays are handed
   // straight to the shared mesh-upload path.
   //
-  // The node + its identity transform are permanent (built once); only the Shape
-  // is swapped, and only when the source vertices change (gated on a checksum),
-  // so a static flex/skin costs just the checksum after the first build. Every
-  // shape/material rebind goes through SetFlexSkinShape.
+  // The node, its identity transform and its TriangleMesh are all permanent
+  // (built once). A deformation is pushed straight into the mesh's per-vertex
+  // attribute inputs, gated on a checksum, so a static flex/skin costs just the
+  // checksum after the first build. The mesh is rebuilt only when the vertex
+  // count or texcoord presence changes; every rebuild and every material rebind
+  // goes through SetFlexSkinShape.
 
   // Removes the flex/skin's current instance and, if `shape` is non-null,
   // adopts it as the held shape; then (re)attaches the held shape with
@@ -3096,7 +3183,11 @@ struct BourbonContext::Impl {
   // by absence). Any rebind re-dirties shape_kind_morphology, which re-runs
   // IndirectDraws stage 1 and reallocates the buffer the shadow cull binds, so
   // it re-primes (the same collision UpdateTransparency/UpdateSelection avoid).
-  void SetFlexSkinShape(FlexSkin& fs, bourbon::RefPtr<bourbon::Shape> shape,
+  // Deformation does NOT come through here -- an attribute push leaves shape
+  // morphology untouched, which is what lets a deforming surface keep its
+  // shadows (it re-primed every frame back when each deformation was a rebind).
+  void SetFlexSkinShape(FlexSkin& fs,
+                        bourbon::RefPtr<bourbon::TriangleMesh> shape,
                         bourbon::RefPtr<bourbon::Material> material) {
     if (fs.shape_instance) {
       fs.node->removeSGObject(fs.shape_instance);
@@ -3115,81 +3206,164 @@ struct BourbonContext::Impl {
     primed = false;
   }
 
-  // Stages flex `f`'s current faces from the decoration mjvScene into `mb` and
-  // sets `checksum` from the face data. Returns false when the flex has no
+  // The shape-relevant description of one flex/skin's geometry this frame: the
+  // de-indexed vertex count and texcoord presence (together the shape's fixed
+  // topology, so a change in either forces a rebuild) plus a checksum of the
+  // deforming source data (a change in that forces a push, nothing more).
+  struct SurfaceGeometry {
+    int vertex_count = 0;
+    bool has_st = false;
+    uint64_t checksum = 0;
+  };
+
+  // Describes flex `f`'s current faces. Returns false when the flex has no
   // active faces (1D flex, or face/skin rendering disabled).
-  bool BuildFlexMesh(int f, MeshBuild& mb, uint64_t& checksum) {
+  bool QueryFlexGeometry(int f, SurfaceGeometry& geom) const {
     const int nface = decor_scene.flexfaceused[f];
     if (nface <= 0) return false;
+    geom.vertex_count = 3 * nface;  // de-indexed triangle soup
+    geom.has_st = model->flex_texcoordadr[f] >= 0;
+    geom.checksum =
+        HashFloats(decor_scene.flexface + 9 * decor_scene.flexfaceadr[f],
+                   static_cast<size_t>(9) * nface, static_cast<uint64_t>(nface));
+    return true;
+  }
+
+  // Describes skin `s`'s geometry. Returns false when the skin has no faces.
+  bool QuerySkinGeometry(int s, SurfaceGeometry& geom) const {
+    const int facenum = model->skin_facenum[s];
+    if (facenum <= 0) return false;
+    geom.vertex_count = 3 * facenum;
+    geom.has_st = model->skin_texcoordadr[s] >= 0;
+    geom.checksum = HashFloats(
+        decor_scene.skinvert + 3 * model->skin_vertadr[s],
+        static_cast<size_t>(3) * model->skin_vertnum[s],
+        static_cast<uint64_t>(facenum));
+    return true;
+  }
+
+  // Writes one de-indexed vertex into `sink`, deriving tangents where the sink
+  // asked for them and extending `bounds` (which the caller must have emptied).
+  static void EmitVertex(const VertexSink& sink, int v,
+                         const Eigen::Vector3f& position,
+                         const Eigen::Vector3f& normal,
+                         const Eigen::Vector2f& st,
+                         Eigen::AlignedBox3f& bounds) {
+    if (sink.positions) sink.positions[v] = position;
+    if (sink.normals) sink.normals[v] = normal;
+    if (sink.dPdU && sink.dPdV) {
+      ComputeTangents(normal, sink.dPdU[v], sink.dPdV[v]);
+    }
+    if (sink.st) sink.st[v] = st;
+    bounds.extend(position);
+  }
+
+  // Stages flex `f`'s faces from the decoration mjvScene, which already holds a
+  // de-indexed triangle soup. `sink` must be sized to the vertex count
+  // QueryFlexGeometry reported for the same frame.
+  void FillFlexVertices(int f, const VertexSink& sink,
+                        Eigen::AlignedBox3f& bounds) const {
     const int adr = decor_scene.flexfaceadr[f];
     const float* face = decor_scene.flexface + 9 * adr;
     const float* norm = decor_scene.flexnormal + 9 * adr;
     const bool has_tc = model->flex_texcoordadr[f] >= 0;
     const float* tex = has_tc ? decor_scene.flextexcoord + 6 * adr : nullptr;
-    checksum = HashFloats(face, static_cast<size_t>(9) * nface,
-                          static_cast<uint64_t>(nface));
 
-    const int nvert = 3 * nface;  // de-indexed triangle soup
-    mb.positions.resize(nvert);
-    mb.normals.resize(nvert);
-    mb.has_st = has_tc;
-    mb.sts.resize(has_tc ? nvert : 0);
+    const int nvert = 3 * decor_scene.flexfaceused[f];
     for (int v = 0; v < nvert; ++v) {
-      mb.positions[v] = {face[3 * v], face[3 * v + 1], face[3 * v + 2]};
-      mb.normals[v] = {norm[3 * v], norm[3 * v + 1], norm[3 * v + 2]};
-      if (has_tc) mb.sts[v] = {tex[2 * v], tex[2 * v + 1]};
+      EmitVertex(sink, v, {face[3 * v], face[3 * v + 1], face[3 * v + 2]},
+                 {norm[3 * v], norm[3 * v + 1], norm[3 * v + 2]},
+                 has_tc ? Eigen::Vector2f(tex[2 * v], tex[2 * v + 1])
+                        : Eigen::Vector2f::Zero(),
+                 bounds);
     }
-    return true;
   }
 
-  // Stages skin `s`'s current geometry: bone-blended world-space vertices and
-  // smoothed normals from the decoration mjvScene, de-indexed through mjModel's
-  // skin_face triangle list, with texcoords from mjModel skin_texcoord. Sets
-  // `checksum` from the (deforming) vertex positions. Returns false when the
-  // skin has no faces.
-  bool BuildSkinMesh(int s, MeshBuild& mb, uint64_t& checksum) {
+  // Stages skin `s`: bone-blended world-space vertices and smoothed normals from
+  // the decoration mjvScene, de-indexed through mjModel's skin_face triangle
+  // list, with texcoords from mjModel skin_texcoord.
+  void FillSkinVertices(int s, const VertexSink& sink,
+                        Eigen::AlignedBox3f& bounds) const {
     const int facenum = model->skin_facenum[s];
-    if (facenum <= 0) return false;
-    const int vertadr = model->skin_vertadr[s];
-    const int vertnum = model->skin_vertnum[s];
     const int faceadr = model->skin_faceadr[s];
-    const float* verts = decor_scene.skinvert + 3 * vertadr;
-    const float* norms = decor_scene.skinnormal + 3 * vertadr;
+    const float* verts = decor_scene.skinvert + 3 * model->skin_vertadr[s];
+    const float* norms = decor_scene.skinnormal + 3 * model->skin_vertadr[s];
     const int tcadr = model->skin_texcoordadr[s];
     const bool has_tc = tcadr >= 0;
     const float* tex = has_tc ? model->skin_texcoord + 2 * tcadr : nullptr;
-    checksum = HashFloats(verts, static_cast<size_t>(3) * vertnum,
-                          static_cast<uint64_t>(facenum));
 
-    const int nvert = 3 * facenum;
-    mb.positions.resize(nvert);
-    mb.normals.resize(nvert);
-    mb.has_st = has_tc;
-    mb.sts.resize(has_tc ? nvert : 0);
     for (int fi = 0; fi < facenum; ++fi) {
       const int* face = model->skin_face + 3 * (faceadr + fi);
       for (int k = 0; k < 3; ++k) {
         const int vid = face[k];  // local index within the skin
-        mb.positions[3 * fi + k] = {verts[3 * vid], verts[3 * vid + 1],
-                                    verts[3 * vid + 2]};
-        mb.normals[3 * fi + k] = {norms[3 * vid], norms[3 * vid + 1],
-                                  norms[3 * vid + 2]};
-        if (has_tc) {
-          mb.sts[3 * fi + k] = {tex[2 * vid], tex[2 * vid + 1]};
-        }
+        EmitVertex(sink, 3 * fi + k,
+                   {verts[3 * vid], verts[3 * vid + 1], verts[3 * vid + 2]},
+                   {norms[3 * vid], norms[3 * vid + 1], norms[3 * vid + 2]},
+                   has_tc ? Eigen::Vector2f(tex[2 * vid], tex[2 * vid + 1])
+                          : Eigen::Vector2f::Zero(),
+                   bounds);
       }
     }
-    return true;
   }
 
-  // Syncs one flex/skin surface: visibility (flags/group/alpha), geometry (Shape
-  // swap gated on the checksum), and material (alpha fade + selection glow).
-  // `build` stages the mesh and checksum; `visible` gates whether it draws at
-  // all; `spec` is the base material spec; `highlighted` whether it carries the
-  // selection glow this frame; `fade` the mjVIS_TRANSPARENT alpha multiplier.
-  template <typename BuildFn>
+  // Pushes one frame of deformed vertices into an already-built flex/skin mesh,
+  // in place: writes the next ring slot, hands the four attribute inputs their
+  // new pointers, and supplies the new bounds (a position push leaves the
+  // shape's own d_bounds at the rest pose, and culling would otherwise use it).
+  // Topology is untouched, so this does not disturb shape morphology and needs
+  // no shadow re-prime -- unlike the SetFlexSkinShape rebuild path.
+  template <typename FillFn>
+  void PushFlexSkinDeformation(FlexSkin& fs, FillFn fill) {
+    const unsigned n = fs.vertex_count;
+    if (!fs.ring_positions.allocated()) {
+      fs.ring_positions.Allocate(*model_heap, n);
+      fs.ring_normals.Allocate(*model_heap, n);
+      fs.ring_dPdU.Allocate(*model_heap, n);
+      fs.ring_dPdV.Allocate(*model_heap, n);
+    }
+
+    const unsigned slot = fs.write_slot;
+    auto& positions = fs.ring_positions.ptrs[slot];
+    auto& normals = fs.ring_normals.ptrs[slot];
+    auto& dPdU = fs.ring_dPdU.ptrs[slot];
+    auto& dPdV = fs.ring_dPdV.ptrs[slot];
+
+    Eigen::AlignedBox3f bounds;
+    bounds.setEmpty();
+    fill(VertexSink{positions.get(), normals.get(), dPdU.get(), dPdV.get(),
+                    nullptr},
+         bounds);
+
+    positions.setModified(0, n);
+    normals.setModified(0, n);
+    dPdU.setModified(0, n);
+    dPdV.setModified(0, n);
+
+    fs.shape->positions().setValue(positions);
+    fs.shape->normals().setValue(normals);
+    fs.shape->dPdU().setValue(dPdU);
+    fs.shape->dPdV().setValue(dPdV);
+    fs.shape->setBounds(bounds);
+
+    fs.write_slot = (slot + 1) % DeformRing<Eigen::Vector3f>::kSlots;
+  }
+
+  // Syncs one flex/skin surface: visibility (flags/group/alpha), geometry, and
+  // material (alpha fade + selection glow). `query` reports the vertex count,
+  // texcoord presence and source checksum; `fill` stages vertices into a sink.
+  // `visible` gates whether it draws at all; `highlighted` whether it carries
+  // the selection glow this frame; `fade` the mjVIS_TRANSPARENT multiplier.
+  //
+  // Geometry takes the cheapest of three paths: unchanged checksum costs
+  // nothing; a deformation at fixed topology is pushed into the existing mesh's
+  // attribute inputs; only a change in vertex count or texcoord presence (a 1D
+  // flex gaining faces, an mjVIS_FLEXSKIN toggle switching a flex between
+  // per-element faces and a smoothed skin) rebuilds the mesh, since a push
+  // cannot express a topology change.
+  template <typename QueryFn, typename FillFn>
   void UpdateOneFlexSkin(const mjModel* m, FlexSkin& fs, bool visible,
-                         bool highlighted, float fade, BuildFn build) {
+                         bool highlighted, float fade, QueryFn query,
+                         FillFn fill) {
     if (!visible) {
       if (fs.visible) {
         fs.node->setVisibility(false);
@@ -3198,11 +3372,14 @@ struct BourbonContext::Impl {
       return;  // keep the held Shape (hidden); no per-frame cost
     }
 
-    MeshBuild mb;
-    uint64_t checksum = 0;
-    if (!build(mb, checksum)) {
+    SurfaceGeometry geom;
+    if (!query(geom)) {
       // Visible per the flags but no faces this frame: detach and hide.
-      if (fs.has_shape) SetFlexSkinShape(fs, {}, {});
+      if (fs.has_shape) {
+        SetFlexSkinShape(fs, {}, {});
+        fs.ReleaseRings();
+        fs.vertex_count = 0;
+      }
       if (fs.visible) {
         fs.node->setVisibility(false);
         fs.visible = false;
@@ -3222,14 +3399,39 @@ struct BourbonContext::Impl {
         highlighted ? HighlightMaterial(m, spec, blended)
                     : GetOrCreateMaterial(m, spec, kind);
 
-    const bool geom_changed = !fs.has_shape || checksum != fs.checksum;
+    const bool topology_changed =
+        !fs.has_shape ||
+        geom.vertex_count != static_cast<int>(fs.vertex_count) ||
+        geom.has_st != fs.has_st;
+    const bool geom_changed = topology_changed || geom.checksum != fs.checksum;
     const bool mat_changed = material.get() != fs.material.get();
-    if (geom_changed) {
+
+    if (topology_changed) {
+      MeshBuild mb;
+      mb.positions.resize(geom.vertex_count);
+      mb.normals.resize(geom.vertex_count);
+      mb.has_st = geom.has_st;
+      mb.sts.resize(geom.has_st ? geom.vertex_count : 0);
+      Eigen::AlignedBox3f bounds;
+      bounds.setEmpty();
+      // Tangents are left null here: CreateTriangleMeshShape derives them.
+      fill(VertexSink{mb.positions.data(), mb.normals.data(), nullptr, nullptr,
+                      geom.has_st ? mb.sts.data() : nullptr},
+           bounds);
+
+      // The rings are sized to the old topology; drop them and let the next
+      // deformation reallocate at the new vertex count.
+      fs.ReleaseRings();
       SetFlexSkinShape(fs, CreateTriangleMeshShape(mb), material);
-      fs.checksum = checksum;
+      fs.vertex_count = fs.has_shape ? geom.vertex_count : 0;
+      fs.has_st = geom.has_st;
+    } else if (geom_changed) {
+      PushFlexSkinDeformation(fs, fill);
+      if (mat_changed) SetFlexSkinShape(fs, {}, material);
     } else if (mat_changed) {
       SetFlexSkinShape(fs, {}, material);  // reuse held shape, new material
     }
+    fs.checksum = geom.checksum;
     fs.blended = blended;
     fs.highlighted = highlighted;
     if (blended) any_transparent = true;
@@ -3290,7 +3492,10 @@ struct BourbonContext::Impl {
                            flexes[f].spec.base_color[3] * fade > 0.0f;
       UpdateOneFlexSkin(
           m, flexes[f], visible, f == sel_flex, fade,
-          [&](MeshBuild& mb, uint64_t& cs) { return BuildFlexMesh(f, mb, cs); });
+          [&](SurfaceGeometry& g) { return QueryFlexGeometry(f, g); },
+          [&](const VertexSink& sink, Eigen::AlignedBox3f& bounds) {
+            FillFlexVertices(f, sink, bounds);
+          });
     }
 
     for (int s = 0; s < static_cast<int>(skins.size()); ++s) {
@@ -3300,7 +3505,10 @@ struct BourbonContext::Impl {
                            skins[s].spec.base_color[3] * fade > 0.0f;
       UpdateOneFlexSkin(
           m, skins[s], visible, s == sel_skin, fade,
-          [&](MeshBuild& mb, uint64_t& cs) { return BuildSkinMesh(s, mb, cs); });
+          [&](SurfaceGeometry& g) { return QuerySkinGeometry(s, g); },
+          [&](const VertexSink& sink, Eigen::AlignedBox3f& bounds) {
+            FillSkinVertices(s, sink, bounds);
+          });
     }
   }
 
