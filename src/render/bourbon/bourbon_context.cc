@@ -60,6 +60,7 @@
 #include <BourbonTG/TaskGraphEvaluator.h>
 
 #include <BourbonSG/Camera.h>
+#include <BourbonSG/Imager.h>
 #include <BourbonSG/LightSource.h>
 #include <BourbonSG/LightSources/DistantLight.h>
 #include <BourbonSG/LightSources/EnvironmentLight.h>
@@ -90,6 +91,7 @@
 
 #include <BourbonCore/Token.h>
 
+#include <BourbonRenderer/CameraResolve.h>
 #include <BourbonRenderer/RendererContext.h>
 #include <BourbonRenderer/World/BXDFIntegrationPipelines.h>
 #include <BourbonRenderer/World/DrawSubmission.h>
@@ -102,7 +104,7 @@
 #include <BourbonRenderer/Passes/ClearFramebufferPass.h>
 #include <BourbonRenderer/Passes/ForwardVizPass.h>
 #include <BourbonRenderer/Passes/GBufferVizPass.h>
-#include <BourbonRenderer/Passes/ResolvePass.h>
+#include <BourbonRenderer/Passes/ImagerPass.h>
 
 #include <mujoco/mujoco.h>
 
@@ -1785,6 +1787,11 @@ struct BourbonContext::Impl {
   // Camera + projection (live via DGInputs, updated per frame).
   bourbon::RefPtr<bourbon::MatrixProjection> projection;
   bourbon::RefPtr<bourbon::Camera> camera;
+  // The screen-space imager run against the resolved radiance: bourbon's
+  // Tonemap, which applies the camera's exposure, ACES and the sRGB encode
+  // (the successor of the old fixed ResolveTask). A model-graph task, so it is
+  // created once alongside the camera and outlives pass-graph rebuilds.
+  bourbon::RefPtr<bourbon::Imager> imager;
   // World->clip matrix (projection * view) for the current frame, used to place
   // geom labels in the ImGui overlay. `camera_valid` is set each frame the
   // camera block runs; a frame with no camera leaves labels un-drawn.
@@ -1796,7 +1803,8 @@ struct BourbonContext::Impl {
   std::unique_ptr<bourbon::BXDFIntegrationPipelines> bxdf_pipelines;
   std::unique_ptr<bourbon::MaterialEvaluationPipelines> material_pipelines;
 
-  // Forward pass graph: clear -> integrate -> resolve into the drawable.
+  // Pass graph: clear -> integrate -> camera resolve -> imager into the
+  // drawable.
   std::unique_ptr<DrawableImageSource> drawable_source;
   std::unique_ptr<bourbon::ClearFramebufferTask> clear_task;
   // Base-class pointer: the concrete integrator (Forward/Deferred/
@@ -1804,7 +1812,10 @@ struct BourbonContext::Impl {
   // per-frame call the plugin makes (setExtent/setDepthRange/output) is on the
   // base.
   std::unique_ptr<bourbon::Integrator> integrator;
-  std::unique_ptr<bourbon::ResolveTask> resolve_task;
+  // The camera-resolve chain (TAA/motion blur/depth of field, all off here, so
+  // a passthrough) between the integrator and the imager.
+  std::unique_ptr<bourbon::CameraResolve> camera_resolve;
+  std::unique_ptr<bourbon::ImagerTask> imager_task;
   bourbon::Timestamp prior_render_signal{};
 
   // Structural pass-graph key: the pass graph is rebuilt when the draw-
@@ -1836,7 +1847,7 @@ struct BourbonContext::Impl {
   // rather than wired here. The depth surface writes window-space z in [0,1]
   // into the HDR colour buffer, so the camera exposure is switched to Manual 1.0
   // while it is active (see ApplyExposure) -- otherwise the ~1e-4 photometric
-  // exposure the ResolvePass applies would crush it to black.
+  // exposure the Tonemap imager applies would crush it to black.
   bool viz_depth = false;
   bool built_viz_depth = false;
 
@@ -2066,9 +2077,23 @@ struct BourbonContext::Impl {
 
     drawable_source = std::make_unique<DrawableImageSource>(*render_graph);
 
-    resolve_task = bourbon::ResolveTask::Create(
+    // TAA off (its stage is a passthrough: this renderer does not jitter the
+    // camera, so there is nothing to accumulate), and no depth of field or
+    // motion blur, so the chain hands the integration output straight through
+    // to the imager, as the old ResolveTask read it.
+    camera_resolve = bourbon::CameraResolve::Create(
+        integrator->output(), camera.get(), world.get(), integrator->taps(),
+        extent, /*taa_enabled=*/false, /*build_dof=*/false,
+        /*build_motion_blur=*/false, *render_graph, *queue, *renderer_context);
+
+    // Tonemap reads no G-buffer plane and binds no camera of its own, but the
+    // taps are passed anyway so the plugs stay wired should the imager change.
+    const bourbon::Taps& taps = integrator->taps();
+    imager_task = bourbon::ImagerTask::Create(
         extent, swapchain->format(), drawable_source->output(),
-        integrator->output(), *camera, *render_graph, *renderer_context);
+        camera_resolve->output(), taps.depth, taps.emissive, taps.normal,
+        *imager, *camera, /*anchor_camera=*/nullptr, *render_graph, *queue,
+        *renderer_context);
 
     built_mode = mode;
     built_oit = oit;
@@ -2085,7 +2110,8 @@ struct BourbonContext::Impl {
   void RebuildPassGraph(bourbon::DrawSubmission::Mode mode,
                         uint64_t shadow_morphology) {
     DrainGpu();
-    resolve_task.reset();
+    imager_task.reset();
+    camera_resolve.reset();
     integrator.reset();
     drawable_source.reset();
     clear_task.reset();
@@ -2101,7 +2127,7 @@ struct BourbonContext::Impl {
   // photometric "sunny-16" preset (calibrated against the scene's physical light
   // magnitudes; see the constructor). A debug-viz surface writes plain [0,1]
   // data (e.g. depth) into the HDR buffer, which the photometric exposure (~1e-4)
-  // would crush in the ResolvePass, so viz modes switch to Manual exposure 1.0;
+  // would crush in the Tonemap imager, so viz modes switch to Manual exposure 1.0;
   // ACES + sRGB in the resolve then map [0,1] to a visible ramp. All pushes are
   // change-gated, so this is a no-op on steady state.
   void ApplyExposure(bool viz) {
@@ -3942,6 +3968,13 @@ BourbonContext::BourbonContext(void* metal_layer)
       *s.model_heap, *s.model_graph, *s.sg_context);
   s.world->model().setViewCamera(s.camera.get());
 
+  // Tonemap has no Camera-kind binding; ImagerTask wires the view camera in
+  // directly, so no anchor camera is bound here.
+  s.imager = bourbon::Imager::Create(
+      *s.renderer_context->findImager(bourbon::Token::Get("Tonemap")), {}, {},
+      bourbon::RefPtr<bourbon::Camera>(), *s.model_heap, *s.model_graph,
+      *s.sg_context);
+
   s.draw_submission = bourbon::DrawSubmission::Create(
       *s.world, *s.camera, *s.render_graph, *s.renderer_context);
   s.bxdf_pipelines = bourbon::BXDFIntegrationPipelines::Create(
@@ -4229,14 +4262,18 @@ void BourbonContext::RenderFrame(const mjModel* model, mjData* data,
     }
     // Per-frame extent push: this is both the pass graph's per-frame tick (it
     // rotates each task's RenderTargetRing) and the live window-resize path.
-    // clear/integrator/resolve each take the drawable extent through their own
-    // extent_in() plug (the integrator fans it out across every sub-pass it
-    // owns), so a resize is a cheap value push with no pass-graph rebuild or GPU
-    // drain. The resolve in particular reads it for its viewport -- unset, it
-    // resolves into a zero-size rect and the window is black.
+    // clear/integrator/camera-resolve/imager each take the drawable extent
+    // through their own extent_in() plug (the integrator and camera resolve fan
+    // it out across every sub-pass they own), so a resize is a cheap value push
+    // with no pass-graph rebuild or GPU drain. The imager in particular reads it
+    // for its viewport -- unset, it resolves into a zero-size rect and the
+    // window is black. Jitter rides the same tick; it is zero because this
+    // renderer does not jitter the camera.
     s.clear_task->extent_in().setValue(extent);
     s.integrator->setExtent(extent);
-    s.resolve_task->extent_in().setValue(extent);
+    s.camera_resolve->setExtent(extent);
+    s.imager_task->extent_in().setValue(extent);
+    s.imager_task->jitter_in().setValue(Eigen::Vector2f::Zero());
     // Live SSAO radius (deferred paths only; a no-op on Forward, whose SSAO
     // stage was never built).
     s.integrator->setSSAORadius(s.ssao_radius);
