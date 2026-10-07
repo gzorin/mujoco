@@ -55,7 +55,10 @@ directories. The rest of the integration lives outside:
 
 - **macOS** with a Metal-capable GPU.
 - **Xcode**.
-- **Bourbon**, built and installed separately. MuJoCo does not fetch it.
+- **Bourbon**, built and installed separately. MuJoCo does not fetch it. The
+  `.app` bundle build (§2) needs Bourbon built as frameworks
+  (`-DBOURBON_BUILD_FRAMEWORKS=ON`). The plain build (§1) works with either
+  layout.
 
 ---
 
@@ -102,8 +105,8 @@ compare against the classic renderer.
 `MUJOCO_USE_FILAMENT=OFF` is worth keeping: Filament is a very large fetch and
 build, and nothing in this backend needs it.
 
-Note that this binary is **not relocatable**: it finds the five Bourbon dylibs
-through an absolute rpath pointing at your Bourbon install. It also finds no
+Note that this binary is **not relocatable**: it finds the five Bourbon libraries
+through an absolute rpath pointing at your Bourbon install's `lib/`. It also finds no
 engine plugins, because they are built into `build-studio/lib` rather than
 anywhere the launcher probes, so models needing `elasticity`, `actuator`,
 `sensor` or `sdf` will fail to load. Both are fixed by the bundle build; for a
@@ -125,7 +128,10 @@ bundle build depends on them explicitly.)
 ## 2. Build the `.app` bundle
 
 Drop `-DMUJOCO_STUDIO_MACOS_BUNDLE=OFF` (it defaults to `ON` whenever studio is
-built on macOS) and build the same target:
+built on macOS) and build the same target. `Bourbon_ROOT` must point at a
+Bourbon install built with `-DBOURBON_BUILD_FRAMEWORKS=ON`, which puts
+`BourbonCore.framework` and its siblings in `lib/`. A plain-dylib install is a
+configure-time error here:
 
 ```sh
 cmake -S . -B build-studio \
@@ -145,7 +151,7 @@ The result is `build-studio/bin/MuJoCo Studio.app`, laid out like this:
 MuJoCo Studio.app/Contents/
 ├── Info.plist
 ├── MacOS/MuJoCo Studio
-├── Frameworks/                      libmujoco + the 5 Bourbon dylibs
+├── Frameworks/                      libmujoco + the 5 Bourbon frameworks
 ├── PlugIns/mujoco_plugin/           elasticity, actuator, sensor, sdf
 └── Resources/                       mujoco_studio.icns, assets/ (fonts)
 ```
@@ -154,14 +160,18 @@ Assembly happens **POST_BUILD, not at install time**, deliberately: the bundle
 you launch out of the build tree during development is byte-for-byte the one
 that ships, so a missing dylib cannot hide until packaging.
 
-The bundle is self-contained. Every dylib is embedded and every load command is
-bundle-relative — the executable's only rpath is
-`@executable_path/../Frameworks`. You can verify that:
+The bundle is self-contained. Every library is embedded and every load command
+is bundle-relative — the executable's only rpath is
+`@executable_path/../Frameworks`. The Bourbon frameworks are copied whole,
+without their `Headers/`, and are not patched. Each binary already has an
+`@rpath/<Name>.framework/...` install name and an `@loader_path/../../..` rpath
+to its sibling frameworks. You can verify that:
 
 ```sh
 B="build-studio/bin/MuJoCo Studio.app"
 for f in "$B/Contents/MacOS/MuJoCo Studio" \
          "$B"/Contents/Frameworks/*.dylib \
+         "$B"/Contents/Frameworks/*.framework/Versions/A/Bourbon* \
          "$B"/Contents/PlugIns/mujoco_plugin/*.dylib; do
   otool -l "$f" | grep -E "^ +(path|name) /" | grep -vE "/System/|/usr/lib/"
 done
@@ -169,8 +179,8 @@ done
 
 Anything printed is a leaked absolute path and a bug. Relatedly, the absolute
 rpath that plain builds use is deliberately **not** added in a bundle build: it
-would let a bundle that failed to embed a dylib still resolve it from your local
-Bourbon install and appear to work on your machine only.
+would let a bundle that failed to embed a framework still resolve it from your
+local Bourbon install and appear to work on your machine only.
 
 ### Code signing
 
@@ -213,7 +223,7 @@ xattr -dr com.apple.quarantine "/Applications/MuJoCo Studio.app"
 | Option | Default | |
 |---|---|---|
 | `MUJOCO_USE_BOURBON` | `OFF` | Enable this backend. macOS only; fatal error elsewhere. |
-| `MUJOCO_STUDIO_MACOS_BUNDLE` | `ON` when `MUJOCO_BUILD_STUDIO` | Build `mujoco_studio` as `MuJoCo Studio.app`. Orthogonal to `MUJOCO_BUILD_MACOS_FRAMEWORKS`, which governs libmujoco's layout. |
+| `MUJOCO_STUDIO_MACOS_BUNDLE` | `ON` when `MUJOCO_BUILD_STUDIO` | Build `mujoco_studio` as `MuJoCo Studio.app`. Requires Bourbon built with `BOURBON_BUILD_FRAMEWORKS=ON`. Orthogonal to `MUJOCO_BUILD_MACOS_FRAMEWORKS`, which governs libmujoco's layout. |
 | `MUJOCO_STUDIO_CODESIGN_IDENTITY` | `-` (ad-hoc) | Identity used to re-sign the bundle. |
 | `MUJOCO_BOURBON_EIGEN_DIR` | `<Bourbon prefix>/include/eigen3` | The Eigen tree Bourbon's dylibs were compiled against. Bourbon vendors and installs its own Eigen here; must match exactly. |
 
@@ -256,9 +266,10 @@ bug is fixed.
 
 | Symptom | |
 |---|---|
+| `MUJOCO_STUDIO_MACOS_BUNDLE requires Bourbon to be installed as frameworks` | Rebuild and reinstall Bourbon with `-DBOURBON_BUILD_FRAMEWORKS=ON`, or configure with `-DMUJOCO_STUDIO_MACOS_BUNDLE=OFF`. |
 | `find_package(Bourbon)` fails | `Bourbon_ROOT` does not point at a prefix containing `lib/cmake/Bourbon/` (or `Bourbon_DIR` not at that config directory). |
 | `connect() type mismatch` at runtime | ABI mismatch — check Eigen tree and that you are testing the build you think you are (see [ABI constraints](#abi-constraints)). |
 | Crash in `Create()` / allocator with garbage pointers | Eigen ABI mismatch (#1 above). |
 | Compile errors in `bourbon_context.cc` after updating Bourbon | API drift; compare against the SHA in `BOURBON_VERSION`. |
 | App will not launch after manual `install_name_tool` surgery | Re-sign it; an invalid signature is fatal on Apple Silicon. |
-| Bundle runs on your machine but not elsewhere | A dylib is missing from `Contents/Frameworks`; run the `otool` sweep in [§3](#3-build-the-app-bundle). |
+| Bundle runs on your machine but not elsewhere | A library is missing from `Contents/Frameworks`; run the `otool` sweep in [§3](#3-build-the-app-bundle). |

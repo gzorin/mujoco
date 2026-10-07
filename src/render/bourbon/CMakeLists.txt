@@ -37,9 +37,23 @@ target_include_directories(render_bourbon
 # Locate the bourbon install prefix from an imported target's on-disk location.
 # The resolution is config-agnostic (a Debug-only install sets
 # IMPORTED_LOCATION_DEBUG, not _RELEASE) and shared with the .app bundle
-# assembly, which needs the same paths to embed these dylibs.
-mujoco_bourbon_imported_location(Bourbon::BourbonCore _bourbon_core_loc)
-get_filename_component(_bourbon_libdir "${_bourbon_core_loc}" DIRECTORY)
+# assembly, which needs the same paths to embed these libraries. Bourbon
+# installs either plain dylibs or, with BOURBON_BUILD_FRAMEWORKS, .framework
+# bundles; both live directly in <prefix>/lib.
+mujoco_bourbon_framework_dir(Bourbon::BourbonCore _bourbon_core_framework)
+if(_bourbon_core_framework)
+  get_filename_component(_bourbon_libdir "${_bourbon_core_framework}" DIRECTORY)
+else()
+  # The bundle embeds whole frameworks rather than patching loose dylibs.
+  if(MUJOCO_STUDIO_MACOS_BUNDLE)
+    message(FATAL_ERROR "render_bourbon: MUJOCO_STUDIO_MACOS_BUNDLE requires "
+      "Bourbon to be installed as frameworks. Rebuild Bourbon with "
+      "-DBOURBON_BUILD_FRAMEWORKS=ON, or configure with "
+      "-DMUJOCO_STUDIO_MACOS_BUNDLE=OFF.")
+  endif()
+  mujoco_bourbon_imported_location(Bourbon::BourbonCore _bourbon_core_loc)
+  get_filename_component(_bourbon_libdir "${_bourbon_core_loc}" DIRECTORY)
+endif()
 get_filename_component(_bourbon_prefix "${_bourbon_libdir}/.." ABSOLUTE)
 
 # This library exchanges Eigen types (Affine3f, Transformation, Array4f, ...)
@@ -122,7 +136,7 @@ target_link_libraries(render_bourbon
 # through the static platform library to the studio executable).
 #
 # Deliberately NOT added for a .app bundle build: an absolute fallback would let
-# a bundle that failed to embed one of the dylibs still resolve it from the
+# a bundle that failed to embed one of the frameworks still resolve it from the
 # local bourbon install and appear to work on this machine only -- exactly the
 # failure the bundle exists to prevent.
 if(NOT MUJOCO_STUDIO_MACOS_BUNDLE)

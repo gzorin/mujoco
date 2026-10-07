@@ -34,7 +34,9 @@ mark_as_advanced(MUJOCO_INSTALL_NAME_TOOL MUJOCO_OTOOL MUJOCO_CODESIGN)
 
 set(MUJOCO_BUNDLE_DYLIB_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/MujocoBundleDylib.cmake")
 
-# The five bourbon dylibs the studio executable resolves through @rpath.
+# The five bourbon libraries the studio executable resolves through @rpath. A
+# bundle build embeds them as frameworks (Bourbon built with
+# BOURBON_BUILD_FRAMEWORKS=ON); a plain build accepts either layout.
 set(MUJOCO_BOURBON_RUNTIME_TARGETS
     Bourbon::BourbonCore
     Bourbon::BourbonTG
@@ -68,6 +70,26 @@ function(mujoco_bourbon_imported_location IMPORTED_TARGET OUT_VAR)
   set(${OUT_VAR} "${_loc}" PARENT_SCOPE)
 endfunction()
 
+# Resolves the .framework directory an imported target lives in, or "" if the
+# target is a plain dylib. The imported location may be the bundle itself or
+# the binary inside it (Foo.framework/Versions/A/Foo, or Foo.framework/Foo for
+# a shallow bundle).
+function(mujoco_bourbon_framework_dir IMPORTED_TARGET OUT_VAR)
+  set(_dir "")
+  get_target_property(_is_framework ${IMPORTED_TARGET} FRAMEWORK)
+  if(_is_framework)
+    mujoco_bourbon_imported_location(${IMPORTED_TARGET} _loc)
+    if(_loc MATCHES "^(.*\\.framework)(/.*)?$")
+      set(_dir "${CMAKE_MATCH_1}")
+    else()
+      message(FATAL_ERROR
+        "mujoco_bourbon_framework_dir: ${IMPORTED_TARGET} is a framework but "
+        "its location ${_loc} is not inside a .framework bundle.")
+    endif()
+  endif()
+  set(${OUT_VAR} "${_dir}" PARENT_SCOPE)
+endfunction()
+
 # Appends a "copy SRC into DST_DIR and reset its LC_RPATHs to RPATH" step to the
 # command list held in LIST_VAR. See cmake/MujocoBundleDylib.cmake for why the
 # existing rpaths are cleared rather than appended to.
@@ -95,8 +117,9 @@ function(_mujoco_studio_append_codesign LIST_VAR PATH)
   set(${LIST_VAR} ${_cmds} PARENT_SCOPE)
 endfunction()
 
-# Stages libmujoco, the bourbon dylibs and the engine plugins into TARGET_NAME's
-# .app, rewrites their runtime search paths, and re-signs the result.
+# Stages libmujoco, the bourbon frameworks and the engine plugins into
+# TARGET_NAME's .app, rewrites runtime search paths where needed, and re-signs
+# the result.
 function(mujoco_studio_assemble_bundle TARGET_NAME)
   if(NOT MUJOCO_INSTALL_NAME_TOOL OR NOT MUJOCO_OTOOL)
     message(FATAL_ERROR
@@ -139,18 +162,29 @@ function(mujoco_studio_assemble_bundle TARGET_NAME)
     endif()
   endif()
 
-  # --- bourbon dylibs --------------------------------------------------------
+  # --- bourbon frameworks ----------------------------------------------------
   if(MUJOCO_USE_BOURBON)
     foreach(_bourbon_target IN LISTS MUJOCO_BOURBON_RUNTIME_TARGETS)
-      mujoco_bourbon_imported_location(${_bourbon_target} _bourbon_loc)
-      get_filename_component(_bourbon_name "${_bourbon_loc}" NAME)
-      # These dylibs reference each other as @rpath/libBourbon*.dylib. Resolving
-      # that through the executable's own LC_RPATH happens to work for a normal
-      # link, but is not guaranteed once anything dlopens them, and @loader_path
-      # costs nothing.
-      _mujoco_studio_append_embed_dylib(
-        _cmds "${_bourbon_loc}" "${_frameworks}" "@loader_path")
-      _mujoco_studio_append_codesign(_sign_cmds "${_frameworks}/${_bourbon_name}")
+      mujoco_bourbon_framework_dir(${_bourbon_target} _bourbon_framework)
+      if(NOT _bourbon_framework)
+        message(FATAL_ERROR
+          "mujoco_studio_assemble_bundle: ${_bourbon_target} is not a "
+          "framework. Build Bourbon with -DBOURBON_BUILD_FRAMEWORKS=ON.")
+      endif()
+      get_filename_component(_bourbon_name "${_bourbon_framework}" NAME)
+      # The bundles are copied whole and left unpatched: each binary already
+      # has an @rpath install name and an @loader_path rpath reaching its
+      # sibling frameworks, both of which hold inside Contents/Frameworks.
+      # Headers are only needed to compile against the framework, so they are
+      # not shipped.
+      list(APPEND _cmds
+           COMMAND rm -rf "${_frameworks}/${_bourbon_name}"
+           COMMAND cp -a "${_bourbon_framework}" "${_frameworks}/"
+           COMMAND rm -rf
+                   "${_frameworks}/${_bourbon_name}/Versions/Current/Headers"
+                   "${_frameworks}/${_bourbon_name}/Headers")
+      _mujoco_studio_append_codesign(
+        _sign_cmds "${_frameworks}/${_bourbon_name}")
     endforeach()
   endif()
 

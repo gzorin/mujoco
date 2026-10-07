@@ -257,7 +257,7 @@ if(NOT EMSCRIPTEN)
     endif()
     configure_studio_target(mujoco_studio)
 
-    # Stage libmujoco, the bourbon dylibs and the engine plugins into the .app,
+    # Stage libmujoco, the bourbon frameworks and the engine plugins into the .app,
     # then re-sign it. POST_BUILD (not install-time) so the bundle launched out
     # of the build tree is the same artifact that ships.
     if(APPLE AND MUJOCO_STUDIO_MACOS_BUNDLE)
